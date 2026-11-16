@@ -1,0 +1,423 @@
+/**
+ * @file  net_dev.c
+ * @brief  WiFi 链路：AP + STA 共存，提供
+ *           - 5555 端口：pyOCD remote 探针（一行一条 JSON）
+ *           - 5556 端口：目标串口原始字节桥
+ */
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "esp_event.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "lwip/sockets.h"
+
+#include "app_cfg.h"
+#include "ble_dev.h"
+#include "dap_server.h"
+#include "link.h"
+#include "net_dev.h"
+#include "serial_bridge.h"
+#include "usb_dev.h"
+
+_Static_assert(sizeof(CONFIG_LINK_AP_PASSWORD) >= 9 &&
+               sizeof(CONFIG_LINK_AP_PASSWORD) <= 64,
+               "Set a private WPA2 passphrase (8-63 bytes) in menuconfig");
+
+static const char *TAG = "net";
+
+static char     s_sta_ip[16] = "0.0.0.0";
+static char     s_ap_ip[16]  = "192.168.4.1";
+static char     s_ssid[33];
+static bool     s_sta_connected;
+static bool     s_sta_configured;
+static unsigned s_ap_clients, s_sta_failures, s_sta_retry_seconds;
+static volatile int s_dap_fd = -1;
+static volatile uint32_t s_dap_epoch = 0;   /* 每次连接自增，防止 fd 复用时写错连接 */
+static volatile int s_serial_fd = -1;
+
+static esp_netif_t *s_sta_netif;
+static esp_netif_t *s_ap_netif;
+
+/* ---------------- 事件 ---------------- */
+
+static void reconnect_timer_cb(void *arg)
+{
+    (void)arg;
+    s_sta_retry_seconds = 0;
+    if (s_sta_configured && !s_sta_connected && !s_ap_clients) esp_wifi_connect();
+}
+
+static esp_timer_handle_t s_reconnect_timer;
+
+static void schedule_reconnect(void)
+{
+    if (!s_sta_configured || s_sta_connected || s_ap_clients) return;
+    unsigned shift = s_sta_failures < 5 ? s_sta_failures++ : 5;
+    unsigned seconds = 2u << shift;
+    if (seconds > 60) seconds = 60;
+    s_sta_retry_seconds = seconds;
+    esp_timer_stop(s_reconnect_timer);
+    esp_timer_start_once(s_reconnect_timer, (uint64_t)seconds * 1000000);
+    ESP_LOGI(TAG, "STA retry in %u seconds (no AP clients)", seconds);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    if (base == WIFI_EVENT) {
+        if (id == WIFI_EVENT_STA_START || id == WIFI_EVENT_STA_DISCONNECTED) {
+            if (id == WIFI_EVENT_STA_DISCONNECTED) {
+                s_sta_connected = false;
+                snprintf(s_sta_ip, sizeof(s_sta_ip), "0.0.0.0");
+                schedule_reconnect();
+            } else if (s_sta_configured && !s_ap_clients) {
+                esp_wifi_connect();
+            }
+        } else if (id == WIFI_EVENT_AP_STACONNECTED) {
+            ++s_ap_clients;
+            esp_timer_stop(s_reconnect_timer);
+            s_sta_retry_seconds = 0;
+            /* A stale router configuration must not keep scanning channels
+             * while a client is using the local OTA / DAP access point. */
+            if (!s_sta_connected) (void)esp_wifi_disconnect();
+            ESP_LOGI(TAG, "AP clients=%u; failed STA retries paused", s_ap_clients);
+        } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
+            if (s_ap_clients) --s_ap_clients;
+            if (!s_ap_clients) schedule_reconnect();
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *ev = (ip_event_got_ip_t *)data;
+        snprintf(s_sta_ip, sizeof(s_sta_ip), IPSTR, IP2STR(&ev->ip_info.ip));
+        s_sta_connected = true;
+        s_sta_failures = s_sta_retry_seconds = 0;
+        ESP_LOGI(TAG, "STA 已获得 IP: %s", s_sta_ip);
+        ESP_LOGI(TAG, "pyOCD 用法: pyocd ... --probe remote:%s:%d", s_sta_ip, cfg_dap_tcp_port());
+    }
+}
+
+/* ---------------- TCP 发送 ---------------- */
+
+static bool send_all(int fd, const uint8_t *data, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        int n = send(fd, data + off, len - off, 0);
+        if (n <= 0) {
+            return false;
+        }
+        off += (size_t)n;
+    }
+    return true;
+}
+
+bool tcp_dap_send(int opaque, const uint8_t *data, size_t len)
+{
+    /* 低 16 位是 fd，高 16 位是会话代号：fd 被复用也不会写错连接 */
+    const int fd = opaque & 0xFFFF;
+    const uint32_t epoch = ((uint32_t)opaque >> 16) & 0x7FFFu;
+    if (fd < 0 || fd != s_dap_fd || epoch != (s_dap_epoch & 0x7FFFu)) {
+        return false;
+    }
+    /* 协议：一行一条 JSON，响应也要以 '\n' 结尾 */
+    static const uint8_t nl = '\n';
+    return send_all(fd, data, len) && send_all(fd, &nl, 1);
+}
+
+bool tcp_serial_send(int fd, const uint8_t *data, size_t len)
+{
+    if (fd < 0) {
+        return false;
+    }
+    return send_all(fd, data, len);
+}
+
+/* ---------------- DAP TCP 服务 ---------------- */
+
+/* 客户端 fd 统一设置：Nagle 关闭 + 1s 发送超时（避免对端不读把任务卡死） */
+static void tune_client_fd(int fd)
+{
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static void tcp_dap_task(void *arg)
+{
+    (void)arg;
+    const int port = cfg_dap_tcp_port();
+    char *buf = malloc(DAP_JSON_BUF + 4096);
+    if (buf == NULL) {
+        ESP_LOGE(TAG, "分配接收缓冲失败");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    for (;;) {
+        int srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (srv < 0) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        int opt = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons((uint16_t)port);
+        if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(srv, 2) != 0) {
+            ESP_LOGE(TAG, "DAP 端口 %d 绑定失败 (errno=%d)", port, errno);
+            close(srv);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+        ESP_LOGI(TAG, "DAP 服务监听 TCP :%d", port);
+
+        for (;;) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(srv, &rfds);
+            struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+            int ready = select(srv + 1, &rfds, NULL, NULL, &tv);
+            if (ready <= 0) {
+                continue;
+            }
+            struct sockaddr_in peer;
+            socklen_t plen = sizeof(peer);
+            int fd = accept(srv, (struct sockaddr *)&peer, &plen);
+            if (fd < 0) {
+                ESP_LOGW(TAG, "accept 失败 (errno=%d)", errno);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            tune_client_fd(fd);
+            s_dap_epoch++;
+            s_dap_fd = fd;
+            dap_server_reset_session();
+            ESP_LOGI(TAG, "DAP 客户端 %s:%d 已连接", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
+
+            size_t used = 0;
+            for (;;) {
+                if (used >= DAP_JSON_BUF) {
+                    used = 0;   /* 溢出保护 */
+                }
+                int n = recv(fd, buf + used, DAP_JSON_BUF - used, 0);
+                if (n <= 0) {
+                    break;
+                }
+                used += (size_t)n;
+                char *start = buf;
+                char *end = buf + used;
+                char *nl;
+                while ((nl = memchr(start, '\n', (size_t)(end - start))) != NULL) {
+                    size_t len = (size_t)(nl - start);
+                    while (len > 0 && start[len - 1] == '\r') {
+                        --len;
+                    }
+                    if (len > 0) {
+                        link_submit(LINK_SINK_TCP, fd | (int)((s_dap_epoch & 0x7FFFu) << 16),
+                        (const uint8_t *)start, len);
+                    }
+                    start = nl + 1;
+                }
+                size_t remain = (size_t)(end - start);
+                if (remain > 0 && start != buf) {
+                    memmove(buf, start, remain);
+                }
+                used = remain;
+            }
+            ESP_LOGI(TAG, "DAP 客户端断开");
+            s_dap_fd = -1;
+            close(fd);
+            dap_server_reset_session();
+        }
+    }
+}
+
+/* ---------------- 串口 TCP 桥 ---------------- */
+
+static bool serial_tcp_sink(int fd, const uint8_t *data, size_t len)
+{
+    return tcp_serial_send(fd, data, len);
+}
+
+static void tcp_serial_task(void *arg)
+{
+    (void)arg;
+    const int port = cfg_serial_tcp_port();
+    uint8_t buf[1024];
+
+    for (;;) {
+        int srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (srv < 0) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        int opt = 1;
+        setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        addr.sin_port = htons((uint16_t)port);
+        if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(srv, 1) != 0) {
+            ESP_LOGE(TAG, "串口端口 %d 绑定失败 (errno=%d)", port, errno);
+            close(srv);
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+        }
+        ESP_LOGI(TAG, "串口桥监听 TCP :%d", port);
+
+        for (;;) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(srv, &rfds);
+            struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+            int ready = select(srv + 1, &rfds, NULL, NULL, &tv);
+            if (ready <= 0) {
+                continue;
+            }
+            struct sockaddr_in peer;
+            socklen_t plen = sizeof(peer);
+            int fd = accept(srv, (struct sockaddr *)&peer, &plen);
+            if (fd < 0) {
+                ESP_LOGW(TAG, "accept 失败 (errno=%d)", errno);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            tune_client_fd(fd);
+            s_serial_fd = fd;
+            serial_bridge_subscribe(serial_tcp_sink, fd);
+            ESP_LOGI(TAG, "串口客户端 %s:%d 已连接", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
+
+            for (;;) {
+                int n = recv(fd, buf, sizeof(buf), 0);
+                if (n <= 0) {
+                    break;
+                }
+                serial_bridge_to_target(buf, (size_t)n);
+            }
+            serial_bridge_unsubscribe(serial_tcp_sink, fd);
+            s_serial_fd = -1;
+            close(fd);
+            ESP_LOGI(TAG, "串口客户端断开");
+        }
+    }
+}
+
+/* ---------------- 初始化 ---------------- */
+
+esp_err_t net_dev_init(void)
+{
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        return err;
+    }
+
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    s_ap_netif = esp_netif_create_default_wifi_ap();
+    esp_netif_set_hostname(s_sta_netif, "esp-swd");
+
+    link_register_sender(LINK_SINK_TCP, tcp_dap_send);
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    err = esp_wifi_init(&init_cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    const esp_timer_create_args_t targs = {
+        .callback = reconnect_timer_cb,
+        .name = "wifi_reconnect",
+    };
+    esp_timer_create(&targs, &s_reconnect_timer);
+
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+
+    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* AP */
+    wifi_config_t ap_cfg;
+    memset(&ap_cfg, 0, sizeof(ap_cfg));
+    snprintf((char *)ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), "%s", CONFIG_LINK_AP_SSID);
+    ap_cfg.ap.ssid_len = (uint8_t)strlen(CONFIG_LINK_AP_SSID);
+    snprintf((char *)ap_cfg.ap.password, sizeof(ap_cfg.ap.password), "%s", CONFIG_LINK_AP_PASSWORD);
+    ap_cfg.ap.channel = 6;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.authmode = (strlen(CONFIG_LINK_AP_PASSWORD) >= 8) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* STA */
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    if (cfg_wifi_get(ssid, sizeof(ssid), pass, sizeof(pass))) {
+        s_sta_configured = true;
+        wifi_config_t sta_cfg;
+        memset(&sta_cfg, 0, sizeof(sta_cfg));
+        snprintf((char *)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), "%s", ssid);
+        snprintf((char *)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), "%s", pass);
+        sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+        esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+        snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
+    } else {
+        ESP_LOGW(TAG, "未配置 WiFi，只开热点 %s (%s)", CONFIG_LINK_AP_SSID, s_ap_ip);
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(s_ap_netif, &ip) == ESP_OK) {
+        snprintf(s_ap_ip, sizeof(s_ap_ip), IPSTR, IP2STR(&ip.ip));
+    }
+
+    xTaskCreate(tcp_dap_task, "tcp_dap", 6144, NULL, 9, NULL);
+    xTaskCreate(tcp_serial_task, "tcp_serial", 4096, NULL, 7, NULL);
+
+    ESP_LOGI(TAG, "热点: %s / %s，地址 %s", CONFIG_LINK_AP_SSID,
+             CONFIG_LINK_AP_PASSWORD, s_ap_ip);
+    return ESP_OK;
+}
+
+const char *net_dev_ip(void)
+{
+    return s_sta_connected ? s_sta_ip : s_ap_ip;
+}
+
+const char *net_dev_ap_ip(void)
+{
+    return s_ap_ip;
+}
+
+bool net_dev_sta_connected(void)
+{
+    return s_sta_connected;
+}
+
+const char *net_dev_ssid(void)
+{
+    return s_ssid[0] ? s_ssid : "(未配置)";
+}
+
+unsigned net_dev_ap_clients(void) { return s_ap_clients; }
+unsigned net_dev_sta_retry_seconds(void) { return s_sta_retry_seconds; }

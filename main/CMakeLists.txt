@@ -1,0 +1,39 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "app_cfg.c"
+        "probe_swd.c"
+        "probe_swd_spi.c"
+        "probe_core.c"
+        "dap_cmsis.c"
+        "dap_server.c"
+        "link.c"
+        "usb_dev.c"
+        "net_dev.c"
+        "ble_dev.c"
+        "ble_ota.c"
+        "wifi_setup.c"
+        "wired_ota.c"
+        "serial_bridge.c"
+        "swd_emu.c"
+        "console_cmds.c"
+    INCLUDE_DIRS "include"
+    REQUIRES
+        espressif__esp_tinyusb
+        driver
+        esp_driver_uart
+        esp_driver_gpio
+        esp_driver_spi
+        esp_hal_gpspi
+        esp_adc
+        esp_timer
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        bt
+        app_update
+        mbedtls
+        espressif__cjson
+        console
+)

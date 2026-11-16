@@ -1,0 +1,319 @@
+/**
+ * @file  usb_dev.c
+ * @brief  USB 复合设备：CMSIS-DAP v1 (HID, 64B 收发) + CDC ACM 虚拟串口。
+ *
+ * 描述符用 TinyUSB 的模板宏拼装，通过 esp_tinyusb 的 tinyusb_driver_install()
+ * 安装（PHY 与 USB 任务由它负责）。产品字符串必须包含 "CMSIS-DAP"，
+ * pyOCD/OpenOCD 都是靠这个名字识别 HID 探针的。
+ */
+#include <stdio.h>
+#include <string.h>
+
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "tinyusb.h"
+#include "tinyusb_cdc_acm.h"
+#include "tusb.h"
+
+#include "app_cfg.h"
+#include "dap_cmsis.h"
+#include "link.h"
+#include "usb_dev.h"
+#include "ble_ota.h"
+
+static const char *TAG = "usb";
+
+/* ---------------- 端点 / 接口编号 ---------------- */
+#define ITF_HID        0
+#define ITF_CDC        1
+#define ITF_TOTAL      3
+
+#define EP_HID_OUT     0x01
+#define EP_HID_IN      0x81
+#define EP_CDC_OUT     0x02
+#define EP_CDC_IN      0x82
+#define EP_CDC_NOTIF   0x83
+
+#define HID_EP_SIZE    64
+#define CDC_EP_SIZE    64
+
+/* ---------------- HID 报告描述符 ----------------
+ * 厂商自定义用途页 0xFF00，64 字节输入 + 64 字节输出，无 Report ID。
+ * 这正是 CMSIS-DAP v1 使用的 HID 报文格式。
+ */
+static const uint8_t s_hid_report_desc[] = {
+    0x06, 0x00, 0xFF,        /* Usage Page (Vendor Defined 0xFF00) */
+    0x09, 0x01,              /* Usage (0x01) */
+    0xA1, 0x01,              /* Collection (Application) */
+    0x15, 0x00,              /*   Logical Minimum (0) */
+    0x26, 0xFF, 0x00,        /*   Logical Maximum (255) */
+    0x75, 0x08,              /*   Report Size (8) */
+    0x95, 0x40,              /*   Report Count (64) */
+    0x09, 0x01,              /*   Usage (0x01) */
+    0x81, 0x02,              /*   Input (Data,Var,Abs) */
+    0x95, 0x40,              /*   Report Count (64) */
+    0x09, 0x01,              /*   Usage (0x01) */
+    0x91, 0x02,              /*   Output (Data,Var,Abs) */
+    0xC0,                    /* End Collection */
+};
+
+/* ---------------- 设备描述符 ---------------- */
+static const tusb_desc_device_t s_device_desc = {
+    .bLength            = sizeof(tusb_desc_device_t),
+    .bDescriptorType    = TUSB_DESC_DEVICE,
+    .bcdUSB             = 0x0200,
+    .bDeviceClass       = TUSB_CLASS_MISC,
+    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
+    .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
+    .idVendor           = CONFIG_USB_DEVICE_VID,
+    .idProduct          = CONFIG_USB_DEVICE_PID,
+    .bcdDevice          = 0x0100,
+    .iManufacturer      = 0x01,
+    .iProduct           = 0x02,
+    .iSerialNumber      = 0x03,
+    .bNumConfigurations = 0x01,
+};
+
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_INOUT_DESC_LEN + TUD_CDC_DESC_LEN)
+
+static const uint8_t s_config_desc[] = {
+    TUD_CONFIG_DESCRIPTOR(1, ITF_TOTAL, 0, CONFIG_TOTAL_LEN, 0x80, 100),
+
+    /* CMSIS-DAP HID 接口（输入 + 输出） */
+    TUD_HID_INOUT_DESCRIPTOR(ITF_HID, 4, HID_ITF_PROTOCOL_NONE,
+                             sizeof(s_hid_report_desc),
+                             EP_HID_OUT, EP_HID_IN, HID_EP_SIZE, 1),
+
+    /* CDC ACM 虚拟串口 */
+    TUD_CDC_DESCRIPTOR(ITF_CDC, 5, EP_CDC_NOTIF, 8, EP_CDC_OUT, EP_CDC_IN, CDC_EP_SIZE),
+};
+
+/* ---------------- 字符串描述符 ---------------- */
+static const char s_langid[2] = {(char)0x09, (char)0x04};
+static char       s_serial_str[32];
+
+static const char *s_string_desc[] = {
+    s_langid,
+    CONFIG_USB_DEVICE_MANUFACTURER,
+    CONFIG_USB_DEVICE_PRODUCT,
+    s_serial_str,
+    "CMSIS-DAP v1 Interface",
+    "ESP-SWD Virtual COM",
+};
+
+static bool    s_mounted;
+static bool    s_cdc_dtr;
+static bool    s_cdc_rts;
+
+/* ---------------- TinyUSB 回调 ---------------- */
+
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
+{
+    (void)instance;
+    return s_hid_report_desc;
+}
+
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                               hid_report_type_t report_type,
+                               uint8_t *buffer, uint16_t reqlen)
+{
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)reqlen;
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                           hid_report_type_t report_type,
+                           uint8_t const *buffer, uint16_t bufsize)
+{
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    if (buffer == NULL || bufsize == 0) {
+        return;
+    }
+    if (bufsize > DAP_PACKET_SIZE) {
+        bufsize = DAP_PACKET_SIZE;
+    }
+    if (link_submit(LINK_SINK_USB, 0, buffer, bufsize) != ESP_OK) {
+        ESP_LOGW(TAG, "HID 请求丢弃（队列满）");
+    }
+}
+
+static void usb_event_cb(tinyusb_event_t *event, void *arg)
+{
+    (void)arg;
+    switch (event->id) {
+    case TINYUSB_EVENT_ATTACHED:
+        s_mounted = true;
+        ESP_LOGI(TAG, "USB 已挂载：CMSIS-DAP(HID) + 虚拟串口(CDC)");
+        break;
+    case TINYUSB_EVENT_DETACHED:
+        ble_ota_disconnected(OTA_OWNER_USB);
+        s_mounted = false;
+        s_cdc_dtr = false;
+        s_cdc_rts = false;
+        ESP_LOGI(TAG, "USB 已断开");
+        break;
+    default:
+        break;
+    }
+}
+
+static void cdc_line_state_cb(int itf, cdcacm_event_t *event)
+{
+    (void)itf;
+    if (event->type == CDC_EVENT_LINE_STATE_CHANGED) {
+        s_cdc_dtr = event->line_state_changed_data.dtr;
+        s_cdc_rts = event->line_state_changed_data.rts;
+    }
+}
+
+/* ---------------- 对外接口 ---------------- */
+
+static bool usb_hid_send_cb(int opaque, const uint8_t *data, size_t len)
+{
+    (void)opaque;
+    usb_dev_hid_send(data, len);
+    return true;
+}
+
+esp_err_t usb_dev_init(void)
+{
+    snprintf(s_serial_str, sizeof(s_serial_str), "%s", cfg_serial_number());
+    link_register_sender(LINK_SINK_USB, usb_hid_send_cb);
+
+    const tinyusb_config_t tusb_cfg = {
+        .port = TINYUSB_PORT_FULL_SPEED_0,
+        .phy = {
+            .skip_setup = false,
+            .self_powered = false,
+            .vbus_monitor_io = -1,
+        },
+        .task = {
+            .size = 4096,
+            .priority = 10,
+            .xCoreID = 0,
+        },
+        .descriptor = {
+            .device = &s_device_desc,
+            .qualifier = NULL,
+            .string = (const char **)s_string_desc,
+            .string_count = sizeof(s_string_desc) / sizeof(s_string_desc[0]),
+            .full_speed_config = s_config_desc,
+            .high_speed_config = NULL,
+        },
+        .pm_lock_enable = false,
+        .event_cb = usb_event_cb,
+        .event_arg = NULL,
+    };
+
+    esp_err_t err = tinyusb_driver_install(&tusb_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "tinyusb_driver_install 失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const tinyusb_config_cdcacm_t acm_cfg = {
+        .cdc_port = TINYUSB_CDC_ACM_0,
+        .callback_rx = NULL,
+        .callback_rx_wanted_char = NULL,
+        .callback_line_state_changed = cdc_line_state_cb,
+        .callback_line_coding_changed = NULL,
+    };
+    err = tinyusb_cdcacm_init(&acm_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "CDC ACM 初始化失败: %s", esp_err_to_name(err));
+    }
+
+    ESP_LOGI(TAG, "USB 设备已就绪 (VID:PID = %04X:%04X)",
+             (unsigned)CONFIG_USB_DEVICE_VID, (unsigned)CONFIG_USB_DEVICE_PID);
+    return ESP_OK;
+}
+
+bool usb_dev_hid_ready(void)
+{
+    return s_mounted && tud_hid_ready();
+}
+
+void usb_dev_hid_send(const uint8_t *data, size_t len)
+{
+    if (!s_mounted) {
+        return;
+    }
+    uint8_t buf[DAP_PACKET_SIZE];
+    memset(buf, 0, sizeof(buf));
+    if (len > sizeof(buf)) {
+        len = sizeof(buf);
+    }
+    memcpy(buf, data, len);
+
+    /* IN 端点忙时等一小会儿，避免吞掉上位机等待的响应 */
+    for (int i = 0; i < 20 && !tud_hid_ready(); ++i) {
+        vTaskDelay(1);
+    }
+    if (!tud_hid_ready()) {
+        ESP_LOGW(TAG, "HID IN 忙，丢弃一个响应");
+        link_note_drop();
+        return;
+    }
+    /* CMSIS-DAP v1 固定 64 字节报文 */
+    tud_hid_report(0, buf, DAP_PACKET_SIZE);
+}
+
+bool usb_dev_cdc_connected(void)
+{
+    /* tud_cdc_connected() requires host DTR. A UART bridge must also serve
+     * terminals that leave DTR deasserted; only require usable USB endpoints. */
+    return s_mounted && tud_cdc_ready();
+}
+
+size_t usb_dev_cdc_read(uint8_t *buf, size_t len)
+{
+    if (!usb_dev_cdc_connected() || buf == NULL || len == 0) {
+        return 0;
+    }
+    size_t rx = 0;
+    /* 走 esp_tinyusb 的封装：内部有临界区，避免和 USB 任务抢 FIFO 指针 */
+    if (tinyusb_cdcacm_read(TINYUSB_CDC_ACM_0, buf, len, &rx) != ESP_OK) {
+        return 0;
+    }
+    return rx;
+}
+
+void usb_dev_cdc_write(const uint8_t *data, size_t len)
+{
+    if (!usb_dev_cdc_connected() || data == NULL || len == 0) {
+        return;
+    }
+    size_t off = 0;
+    int spin = 0;
+    while (off < len) {
+        size_t n = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, data + off, len - off);
+        off += n;
+        (void)tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(20));
+        if (off < len) {
+            if (++spin > 50) {          /* 约 1s 还写不进去，放弃剩余数据 */
+                break;
+            }
+            vTaskDelay(1);
+        } else {
+            spin = 0;
+        }
+    }
+}
+
+bool usb_dev_cdc_dtr(void)
+{
+    return s_cdc_dtr;
+}
+
+bool usb_dev_cdc_rts(void)
+{
+    return s_cdc_rts;
+}
