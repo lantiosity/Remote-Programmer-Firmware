@@ -74,7 +74,6 @@ static void worker(void *unused)
         char *id = strtok_r(job.text, " ", &save);
         char *op = strtok_r(NULL, " ", &save);
         cJSON *root = reply(id ? id : "");
-        uint8_t status[20]; ble_ota_status(status);
         bool restart = false;
         if (!op) fail(root, "invalid_request");
         else if (!strcmp(op, "status")) {
@@ -85,7 +84,7 @@ static void worker(void *unused)
             cJSON_AddBoolToObject(root, "connected", net_dev_sta_connected());
             cJSON_AddStringToObject(root, "ip", net_dev_ip());
             cJSON_AddStringToObject(root, "ap_ip", net_dev_ap_ip());
-            cJSON_AddBoolToObject(root, "armed", (status[3] & 1) != 0);
+            cJSON_AddBoolToObject(root, "armed", ble_ota_window_for(job.usb ? OTA_ALLOW_USB : OTA_ALLOW_BLE));
         } else if (!strcmp(op, "scan") || !strcmp(op, "page")) {
             unsigned page = 0;
             esp_err_t err = ESP_OK;

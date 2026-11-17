@@ -40,6 +40,8 @@ if os.name == 'nt':
 lib = ctypes.CDLL(str(library))
 lib.dap_server_process.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
 lib.dap_server_process.restype = ctypes.c_size_t
+lib.test_ota_window.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_uint, ctypes.c_uint]
+lib.test_ota_window.restype = ctypes.c_bool
 
 # Compile the real MEM-AP implementation against a posted-read / 1 KiB TAR
 # model. This detects corruption that an implementation-shaped memcpy mock
@@ -227,6 +229,18 @@ class SerialTests(unittest.TestCase):
         for token in range(5): serial.test_unsubscribe(token)
         self.assertEqual(ctypes.c_uint.in_dll(serial,'mock_locks_held').value,0)
         self.assertEqual(ctypes.c_uint.in_dll(serial,'mock_lock_errors').value,0)
+
+
+class OtaAuthorizationTests(unittest.TestCase):
+    def test_transport_masks_and_expiry(self):
+        for allowed in range(8):
+            for transport in [1,2,4,7]:
+                with self.subTest(allowed=allowed,transport=transport):
+                    self.assertEqual(lib.test_ota_window(99,100,allowed,transport),bool(allowed & transport))
+                    self.assertFalse(lib.test_ota_window(100,100,allowed,transport))
+                    self.assertFalse(lib.test_ota_window(101,100,allowed,transport))
+        self.assertTrue(lib.test_ota_window(2**40,2**40+1,1,1))
+        self.assertFalse(lib.test_ota_window(1,0,7,7))
 
 
 if __name__ == '__main__':

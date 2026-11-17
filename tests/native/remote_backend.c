@@ -1,5 +1,9 @@
 #include <string.h>
 #include "probe_core.h"
+#include "ota_policy.h"
+
+bool test_ota_window(int64_t now, int64_t deadline, unsigned allowed, unsigned requested)
+{ return ota_window_open(now, deadline, allowed, requested); }
 
 unsigned test_count, test_apsel, test_calls, test_bits;
 uint8_t test_data[8192];

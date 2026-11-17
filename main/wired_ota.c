@@ -76,7 +76,7 @@ static esp_err_t request(uint16_t owner, uint8_t kind, const uint8_t *p, size_t 
          * Never block TinyUSB callbacks; USB requests execute on dap_worker. */
         int64_t deadline = esp_timer_get_time() + 15000000;
         for (;;) {
-            ble_ota_status(out);
+            ble_ota_status_for(owner, out);
             if (!(out[3] & 2)) break;
             if (esp_timer_get_time() >= deadline) {
                 ble_ota_disconnected(owner);
@@ -85,7 +85,7 @@ static esp_err_t request(uint16_t owner, uint8_t kind, const uint8_t *p, size_t 
             vTaskDelay(1);
         }
     } else if (kind != 3 || n != 0) return ESP_ERR_INVALID_ARG;
-    ble_ota_status(out);
+    ble_ota_status_for(owner, out);
     *used = 20;
     return ESP_OK;
 }

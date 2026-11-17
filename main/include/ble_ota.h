@@ -19,6 +19,8 @@ esp_err_t ble_ota_arm(uint32_t seconds);
 esp_err_t ble_ota_arm_transport(uint32_t seconds, unsigned transports);
 bool ble_ota_window_for(unsigned transport);
 void ble_ota_status(uint8_t out[20]);
+/* Same protocol v1 payload, with armed/state scoped to this adapter's owner. */
+void ble_ota_status_for(uint16_t owner, uint8_t out[20]);
 size_t ble_ota_info(char *out, size_t capacity);
 void ble_ota_boot_confirm(bool healthy);
 

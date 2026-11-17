@@ -20,6 +20,7 @@
 #include "app_cfg.h"
 #include "ble_ota.h"
 #include "net_dev.h"
+#include "ota_policy.h"
 
 enum { IDLE, ARMED, PREPARING, RECEIVING, VERIFYING, READY, REBOOTING, ERROR };
 enum { BEGIN = 1, DATA, FINISH, ACTIVATE, ABORT };
@@ -67,19 +68,36 @@ static void put32(uint8_t *p, uint32_t v)
     for (unsigned i = 0; i < 4; ++i) p[i] = (uint8_t)(v >> (8 * i));
 }
 
-void ble_ota_status(uint8_t out[20])
+static unsigned owner_transport(uint16_t owner)
+{
+    return owner == OTA_OWNER_USB ? OTA_ALLOW_USB :
+        owner == OTA_OWNER_WIFI ? OTA_ALLOW_WIFI : OTA_ALLOW_BLE;
+}
+
+static void status_for_transport(unsigned transport, uint8_t out[20])
 {
     int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_lock);
+    bool armed = ota_window_open(now, s_armed_until, s_armed_transports, transport);
     out[0] = 1;
-    out[1] = s_state == ARMED && now >= s_armed_until ? IDLE : s_state;
+    out[1] = s_state == ARMED && !armed ? IDLE : s_state;
     out[2] = s_op;
-    out[3] = (now < s_armed_until ? 1 : 0) | (s_busy ? 2 : 0);
+    out[3] = (armed ? 1 : 0) | (s_busy ? 2 : 0);
     put32(out + 4, s_received);
     put32(out + 8, s_total);
     put32(out + 12, s_error);
     put32(out + 16, s_session);
     portEXIT_CRITICAL(&s_lock);
+}
+
+void ble_ota_status(uint8_t out[20])
+{
+    status_for_transport(OTA_ALLOW_ALL, out);
+}
+
+void ble_ota_status_for(uint16_t owner, uint8_t out[20])
+{
+    status_for_transport(owner_transport(owner), out);
 }
 
 bool ble_ota_in_progress(void)
@@ -129,7 +147,7 @@ static void notify_worker(struct ble_npl_event *event)
     portEXIT_CRITICAL(&s_lock);
     if (conn >= OTA_OWNER_USB) return;
     uint8_t status[20];
-    ble_ota_status(status);
+    ble_ota_status_for(conn, status);
     static uint32_t requested_session;
     uint32_t session = get32(status + 16);
     if (status[1] == RECEIVING && status[2] == BEGIN && session != requested_session) {
@@ -181,7 +199,7 @@ bool ble_ota_window_for(unsigned transport)
 {
     int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_lock);
-    bool allowed = now < s_armed_until && (s_armed_transports & transport) != 0;
+    bool allowed = ota_window_open(now, s_armed_until, s_armed_transports, transport);
     portEXIT_CRITICAL(&s_lock);
     return allowed;
 }
@@ -309,7 +327,7 @@ static int access_ota(uint16_t conn, uint16_t handle, struct ble_gatt_access_ctx
         uint8_t status[20];
         char info[512];
         if (kind == 3) {
-            ble_ota_status(status);
+            ble_ota_status_for(conn, status);
             return os_mbuf_append(ctxt->om, status, sizeof(status)) ? BLE_ATT_ERR_INSUFFICIENT_RES : 0;
         }
         size_t n = ble_ota_info(info, sizeof(info));
@@ -355,10 +373,9 @@ esp_err_t ble_ota_submit(uint16_t owner, uint8_t op, const uint8_t *payload, siz
         portEXIT_CRITICAL(&s_lock); return ESP_ERR_INVALID_STATE;
     }
     bool active = s_state >= PREPARING && s_state <= READY;
-    unsigned transport = owner == OTA_OWNER_USB ? OTA_ALLOW_USB :
-        owner == OTA_OWNER_WIFI ? OTA_ALLOW_WIFI : OTA_ALLOW_BLE;
+    unsigned transport = owner_transport(owner);
     if ((active && s_owner != owner) ||
-        (job.op == BEGIN && (active || now >= s_armed_until || !(s_armed_transports & transport))) ||
+        (job.op == BEGIN && (active || !ota_window_open(now, s_armed_until, s_armed_transports, transport))) ||
         (job.op != BEGIN && (!active || s_owner != owner))) {
         portEXIT_CRITICAL(&s_lock); return ESP_ERR_NOT_ALLOWED;
     }
