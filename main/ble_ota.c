@@ -41,6 +41,7 @@ static uint8_t s_state, s_op;
 static uint32_t s_received, s_total, s_error, s_session, s_epoch;
 static bool s_busy, s_cancel;
 static int64_t s_armed_until, s_last_activity;
+static unsigned s_armed_transports;
 static esp_ota_handle_t s_handle;
 static const esp_partition_t *s_partition;
 static psa_hash_operation_t s_hash = PSA_HASH_OPERATION_INIT;
@@ -108,12 +109,12 @@ size_t ble_ota_info(char *out, size_t capacity)
         "{\"protocol\":1,\"wifi_setup\":1,\"serial\":\"%s\",\"project\":\"%s\",\"version\":\"%s\","
         "\"running\":\"%s\",\"boot\":\"%s\",\"slot_size\":%lu,\"image_state\":%u,"
         "\"elf_sha256\":\"%s\",\"layout\":%u,\"factory_size\":%lu,\"offline_size\":%lu,"
-        "\"ota_port\":5557,\"wifi_ip\":\"%s\",\"wifi_sta\":%s,\"ap_clients\":%u,\"sta_retry_s\":%u}",
+        "\"ota_port\":%u,\"wifi_ip\":\"%s\",\"wifi_sta\":%s,\"ap_clients\":%u,\"sta_retry_s\":%u}",
         cfg_serial_number(), app->project_name, app->version,
         running ? running->label : "", boot ? boot->label : "",
         (unsigned long)(next ? next->size : 0), (unsigned)state, elf, offline ? 2 : 1,
         (unsigned long)(factory ? factory->size : 0), (unsigned long)(offline ? offline->size : 0),
-        net_dev_ip(), net_dev_sta_connected() ? "true" : "false",
+        (unsigned)CONFIG_LINK_OTA_TCP_PORT, net_dev_ip(), net_dev_sta_connected() ? "true" : "false",
         net_dev_ap_clients(), net_dev_sta_retry_seconds());
     return n > 0 && (size_t)n < capacity ? (size_t)n : 0;
 }
@@ -149,8 +150,9 @@ static void publish(uint8_t state, uint8_t op, uint32_t error)
     s_op = op;
     s_error = error;
     s_busy = false;
+    bool notify = s_notifications_ready && s_owner < OTA_OWNER_USB;
     portEXIT_CRITICAL(&s_lock);
-    if (s_notifications_ready && s_owner < OTA_OWNER_USB)
+    if (notify)
         ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_notify_event);
 }
 
@@ -172,8 +174,22 @@ static void fail(uint8_t op, uint32_t error)
 
 esp_err_t ble_ota_arm(uint32_t seconds)
 {
+    return ble_ota_arm_transport(seconds, OTA_ALLOW_ALL);
+}
+
+bool ble_ota_window_for(unsigned transport)
+{
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_lock);
+    bool allowed = now < s_armed_until && (s_armed_transports & transport) != 0;
+    portEXIT_CRITICAL(&s_lock);
+    return allowed;
+}
+
+esp_err_t ble_ota_arm_transport(uint32_t seconds, unsigned transports)
+{
     if (!s_jobs) return ESP_ERR_INVALID_STATE;
-    if (seconds > 600) return ESP_ERR_INVALID_ARG;
+    if (seconds > 600 || !transports || (transports & ~OTA_ALLOW_ALL)) return ESP_ERR_INVALID_ARG;
     int64_t deadline = esp_timer_get_time() + (int64_t)seconds * 1000000;
     portENTER_CRITICAL(&s_lock);
     if (s_busy || (s_state >= PREPARING && s_state <= REBOOTING)) {
@@ -181,10 +197,11 @@ esp_err_t ble_ota_arm(uint32_t seconds)
         return ESP_ERR_INVALID_STATE;
     }
     s_armed_until = seconds ? deadline : 0;
+    s_armed_transports = seconds ? transports : 0;
     s_state = seconds ? ARMED : IDLE;
     s_error = 0;
     portEXIT_CRITICAL(&s_lock);
-    ESP_LOGI(TAG, "OTA window: %lu seconds", (unsigned long)seconds);
+    ESP_LOGI(TAG, "OTA window: %lu seconds, transport mask=%u", (unsigned long)seconds, transports);
     return ESP_OK;
 }
 
@@ -206,6 +223,10 @@ void ble_ota_disconnected(uint16_t conn)
 
 static void process(const ota_job_t *job)
 {
+    portENTER_CRITICAL(&s_lock);
+    uint8_t state = s_state;
+    uint32_t received = s_received, total = s_total;
+    portEXIT_CRITICAL(&s_lock);
     if (job->op == BEGIN) {
         discard();
         const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
@@ -224,13 +245,15 @@ static void process(const ota_job_t *job)
         if (psa_hash_setup(&s_hash, PSA_ALG_SHA_256) != PSA_SUCCESS) {
             fail(BEGIN, ESP_FAIL); return;
         }
+        portENTER_CRITICAL(&s_lock);
         s_last_activity = esp_timer_get_time();
+        portEXIT_CRITICAL(&s_lock);
         publish(RECEIVING, BEGIN, 0);
     } else if (job->op == DATA) {
         uint32_t offset = get32(job->payload);
         size_t size = job->length - 4;
-        if (s_state != RECEIVING || offset != s_received) { fail(DATA, ERR_OFFSET); return; }
-        if (size > s_total - s_received) { fail(DATA, ERR_SIZE); return; }
+        if (state != RECEIVING || offset != received) { fail(DATA, ERR_OFFSET); return; }
+        if (received > total || size > total - received) { fail(DATA, ERR_SIZE); return; }
         esp_err_t err = esp_ota_write(s_handle, job->payload + 4, size);
         if (err != ESP_OK) { fail(DATA, err); return; }
         if (psa_hash_update(&s_hash, job->payload + 4, size) != PSA_SUCCESS) {
@@ -238,11 +261,11 @@ static void process(const ota_job_t *job)
         }
         portENTER_CRITICAL(&s_lock);
         s_received += size;
-        portEXIT_CRITICAL(&s_lock);
         s_last_activity = esp_timer_get_time();
+        portEXIT_CRITICAL(&s_lock);
         publish(RECEIVING, DATA, 0);
     } else if (job->op == FINISH) {
-        if (s_state != RECEIVING || s_received != s_total) { fail(FINISH, ERR_SIZE); return; }
+        if (state != RECEIVING || received != total) { fail(FINISH, ERR_SIZE); return; }
         portENTER_CRITICAL(&s_lock);
         s_state = VERIFYING;
         portEXIT_CRITICAL(&s_lock);
@@ -257,10 +280,12 @@ static void process(const ota_job_t *job)
         err = esp_ota_get_partition_description(s_partition, &app);
         if (err != ESP_OK || strncmp(app.project_name, esp_app_get_description()->project_name,
                                      sizeof(app.project_name))) { fail(FINISH, ERR_PROJECT); return; }
+        portENTER_CRITICAL(&s_lock);
         s_last_activity = esp_timer_get_time();
+        portEXIT_CRITICAL(&s_lock);
         publish(READY, FINISH, 0); /* Boot partition still unchanged. */
     } else if (job->op == ACTIVATE) {
-        if (s_state != READY || !s_partition) { fail(ACTIVATE, ERR_PROTOCOL); return; }
+        if (state != READY || !s_partition) { fail(ACTIVATE, ERR_PROTOCOL); return; }
         esp_err_t err = esp_ota_set_boot_partition(s_partition);
         if (err != ESP_OK) { fail(ACTIVATE, err); return; }
         publish(REBOOTING, ACTIVATE, 0);
@@ -330,8 +355,10 @@ esp_err_t ble_ota_submit(uint16_t owner, uint8_t op, const uint8_t *payload, siz
         portEXIT_CRITICAL(&s_lock); return ESP_ERR_INVALID_STATE;
     }
     bool active = s_state >= PREPARING && s_state <= READY;
+    unsigned transport = owner == OTA_OWNER_USB ? OTA_ALLOW_USB :
+        owner == OTA_OWNER_WIFI ? OTA_ALLOW_WIFI : OTA_ALLOW_BLE;
     if ((active && s_owner != owner) ||
-        (job.op == BEGIN && (active || now >= s_armed_until)) ||
+        (job.op == BEGIN && (active || now >= s_armed_until || !(s_armed_transports & transport))) ||
         (job.op != BEGIN && (!active || s_owner != owner))) {
         portEXIT_CRITICAL(&s_lock); return ESP_ERR_NOT_ALLOWED;
     }
@@ -346,9 +373,14 @@ esp_err_t ble_ota_submit(uint16_t owner, uint8_t op, const uint8_t *payload, siz
     return ESP_OK;
 }
 
+#ifdef CONFIG_BLE_OTA_REQUIRE_ENCRYPTION
+#define OTA_WRITE_FLAGS (BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC)
+#else
+#define OTA_WRITE_FLAGS BLE_GATT_CHR_F_WRITE
+#endif
 static const struct ble_gatt_chr_def s_chars[] = {
-    {.uuid=&s_control_uuid.u, .access_cb=access_ota, .arg=(void *)1, .flags=BLE_GATT_CHR_F_WRITE},
-    {.uuid=&s_data_uuid.u, .access_cb=access_ota, .arg=(void *)2, .flags=BLE_GATT_CHR_F_WRITE},
+    {.uuid=&s_control_uuid.u, .access_cb=access_ota, .arg=(void *)1, .flags=OTA_WRITE_FLAGS},
+    {.uuid=&s_data_uuid.u, .access_cb=access_ota, .arg=(void *)2, .flags=OTA_WRITE_FLAGS},
     {.uuid=&s_status_uuid.u, .access_cb=access_ota, .arg=(void *)3,
      .flags=BLE_GATT_CHR_F_READ|BLE_GATT_CHR_F_NOTIFY, .val_handle=&s_status_handle},
     {.uuid=&s_info_uuid.u, .access_cb=access_ota, .arg=(void *)4, .flags=BLE_GATT_CHR_F_READ},
@@ -389,7 +421,14 @@ static void worker(void *arg)
         }
         if (have_job && job.epoch == epoch && !cancel) process(&job);
         int64_t now = esp_timer_get_time();
-        if ((s_state == RECEIVING || s_state == READY) && now - s_last_activity > 30000000)
+        portENTER_CRITICAL(&s_lock);
+        int64_t timeout_us = (int64_t)(s_state == READY ? CONFIG_OTA_READY_TIMEOUT_SECONDS :
+            CONFIG_OTA_IDLE_TIMEOUT_SECONDS) * 1000000;
+        bool expired = !s_busy && !s_cancel && (s_state == RECEIVING || s_state == READY) &&
+            now - s_last_activity > timeout_us;
+        if (expired) s_busy = true; /* Reserve the timeout transition against new jobs. */
+        portEXIT_CRITICAL(&s_lock);
+        if (expired)
             fail(ABORT, ERR_TIMEOUT);
         if (confirm_at && now >= confirm_at) {
             portENTER_CRITICAL(&s_lock); s_confirm_at = 0; portEXIT_CRITICAL(&s_lock);
@@ -444,5 +483,7 @@ esp_err_t ble_ota_init(void)
 void ble_ota_enable_notifications(void)
 {
     ble_npl_event_init(&s_notify_event, notify_worker, NULL);
+    portENTER_CRITICAL(&s_lock);
     s_notifications_ready = true;
+    portEXIT_CRITICAL(&s_lock);
 }

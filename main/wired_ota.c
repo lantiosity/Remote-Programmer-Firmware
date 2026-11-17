@@ -14,6 +14,7 @@
 #include "ble_ota.h"
 #include "wired_ota.h"
 #include "wifi_setup.h"
+#include "sdkconfig.h"
 static char s_wifi_rx[224];
 static size_t s_wifi_rx_len;
 
@@ -64,7 +65,7 @@ static esp_err_t request(uint16_t owner, uint8_t kind, const uint8_t *p, size_t 
     if (kind == 5) {
         if (owner != OTA_OWNER_USB) return ESP_ERR_NOT_ALLOWED;
         if (n != 2) return ESP_ERR_INVALID_ARG;
-        err = ble_ota_arm(get16(p));
+        err = ble_ota_arm_transport(get16(p), OTA_ALLOW_USB);
         if (err != ESP_OK) return err;
     } else if (kind == 1 || kind == 2) {
         if (!n) return ESP_ERR_INVALID_ARG;
@@ -126,7 +127,7 @@ static void tcp_task(void *arg)
 {
     int server = (int)(intptr_t)arg;
     uint8_t input[OTA_MAX_PAYLOAD], output[516], header[8];
-    ESP_LOGI(TAG, "WiFi self-OTA listening on TCP :5557");
+    ESP_LOGI(TAG, "WiFi self-OTA listening on TCP :%d", CONFIG_LINK_OTA_TCP_PORT);
     for (;;) {
         int fd = accept(server, NULL, NULL);
         if (fd < 0) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
@@ -159,7 +160,7 @@ esp_err_t wired_ota_net_start(void)
     if (fd < 0) return ESP_FAIL;
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(5557),
+    struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(CONFIG_LINK_OTA_TCP_PORT),
                                   .sin_addr.s_addr = htonl(INADDR_ANY)};
     if (bind(fd, (struct sockaddr *)&address, sizeof(address)) || listen(fd, 1)) {
         close(fd); return ESP_FAIL;

@@ -5,12 +5,14 @@ menu "ESP-SWD DAPLink 配置"
         config PROBE_SWCLK_GPIO
             int "SWCLK 引脚 (GPIO 编号)"
             default 4
+            range 0 31
             help
                 SWD 时钟线，接到目标板 SWCLK。
 
         config PROBE_SWDIO_GPIO
             int "SWDIO 引脚 (GPIO 编号)"
             default 5
+            range 0 31
             help
                 SWD 数据线，接到目标板 SWDIO。
 
@@ -97,6 +99,21 @@ menu "ESP-SWD DAPLink 配置"
             int "串口桥 TCP 端口"
             default 5556
 
+        config LINK_OTA_TCP_PORT
+            int "ESP32 OTA TCP port"
+            range 1 65535
+            default 5557
+
+        config OTA_IDLE_TIMEOUT_SECONDS
+            int "OTA receive idle timeout (seconds)"
+            range 30 600
+            default 120
+
+        config OTA_READY_TIMEOUT_SECONDS
+            int "OTA verified image activation timeout (seconds)"
+            range 60 3600
+            default 600
+
     endmenu
 
     menu "5. 蓝牙链路"
@@ -116,6 +133,13 @@ menu "ESP-SWD DAPLink 配置"
             help
                 默认开发板 BOOT 按钮。只在程序运行时长按，不要同时复位。
                 也可用控制台 ota arm 开放 5 分钟升级窗口。
+
+        config BLE_OTA_REQUIRE_ENCRYPTION
+            bool "Require an encrypted BLE connection for OTA writes"
+            default y
+            help
+                Pair/encrypt the BLE connection before uploading firmware.
+                Just Works encryption is not image signing or MITM protection.
 
     endmenu
 

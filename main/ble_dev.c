@@ -419,6 +419,8 @@ esp_err_t ble_dev_init(void)
     ble_npl_callout_init(&s_tx_retry, nimble_port_get_dflt_eventq(), ble_tx_worker, NULL);
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
+    ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
+    ble_hs_cfg.sm_sc = 1;
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
