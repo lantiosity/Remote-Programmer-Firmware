@@ -7,6 +7,7 @@
  * 协议为一行 JSON 请求 / 一行 JSON 响应，是 pyOCD 自带 tcp_probe_server 的对端实现。
  */
 #include <inttypes.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,8 +33,8 @@ static const char *TAG = "dap-remote";
 #define MAX_AP_HANDLES  4
 #define MAX_BLOCK_WORDS 2048
 /* 单条 JSON 文本长度上限（响应缓冲扣掉头部），用于反推安全的数据量 */
-#define MAX_BLOCK32_WORDS ((DAP_JSON_BUF - 256) / 12)
-#define MAX_BLOCK8_BYTES  ((DAP_JSON_BUF - 256) / 4)
+#define MAX_BLOCK32_WORDS DAP_MAX_READ_WORDS
+#define MAX_BLOCK8_BYTES  DAP_MAX_READ_BYTES
 
 static uint32_t s_block[MAX_BLOCK_WORDS];
 static uint8_t  s_bytes[MAX_BLOCK_WORDS * 4];
@@ -157,7 +158,10 @@ static bool arg_int(cJSON *args, int idx, int64_t *out)
     if (it == NULL || !cJSON_IsNumber(it)) {
         return false;
     }
-    *out = (int64_t)it->valuedouble;
+    double value = it->valuedouble;
+    if (!isfinite(value) || value < -9223372036854775808.0 ||
+        value >= 9223372036854775808.0 || trunc(value) != value) return false;
+    *out = (int64_t)value;
     return true;
 }
 
@@ -261,23 +265,121 @@ static int parse_u32_array(cJSON *args, int idx, uint32_t *out, uint32_t max)
     uint32_t n = 0;
     cJSON *it = NULL;
     cJSON_ArrayForEach(it, arr) {
-        if (n >= max) {
-            break;
-        }
-        if (cJSON_IsNumber(it)) {
-            out[n++] = (uint32_t)(int64_t)it->valuedouble;
-        }
+        if (n >= max || !cJSON_IsNumber(it) || !isfinite(it->valuedouble) ||
+            it->valuedouble < 0 || it->valuedouble > UINT32_MAX ||
+            trunc(it->valuedouble) != it->valuedouble) return -1;
+        out[n++] = (uint32_t)it->valuedouble;
     }
     return (int)n;
 }
 
+static int parse_byte_array(cJSON *args, int idx, uint8_t *out, size_t max)
+{
+    cJSON *arr = cJSON_GetArrayItem(args, idx), *it;
+    if (!cJSON_IsArray(arr)) return -1;
+    size_t n = 0;
+    cJSON_ArrayForEach(it, arr) {
+        if (n >= max || !cJSON_IsNumber(it) || !isfinite(it->valuedouble) ||
+            it->valuedouble < 0 || it->valuedouble > 255 ||
+            trunc(it->valuedouble) != it->valuedouble) return -1;
+        out[n++] = (uint8_t)it->valuedouble;
+    }
+    return (int)n;
+}
+
+/* cJSON stores numbers as doubles. Recover the second arguments token from
+ * the validated JSON text, skipping strings/nested values, before rounding. */
+static const char *skip_space(const char *p, const char *end)
+{
+    while (p < end && (*p == ' ' || *p == '\r' || *p == '\n' || *p == '\t')) ++p;
+    return p;
+}
+
+static const char *skip_json_value(const char *p, const char *end)
+{
+    int depth = 0;
+    bool quoted = false;
+    for (; p < end; ++p) {
+        if (quoted) {
+            if (*p == '\\' && p + 1 < end) ++p;
+            else if (*p == '"') quoted = false;
+        } else if (*p == '"') quoted = true;
+        else if (*p == '[' || *p == '{') ++depth;
+        else if (*p == ']' || *p == '}') {
+            if (!depth) break;
+            if (--depth == 0) return p + 1;
+        } else if (*p == ',' && !depth) break;
+    }
+    return p;
+}
+
+static bool parse_swj_bits(const char *line, size_t length, cJSON *args, uint8_t out[32])
+{
+    const char *begin = NULL, *end = NULL;
+    cJSON *item = cJSON_GetArrayItem(args, 1);
+    unsigned base = 10;
+    if (cJSON_IsString(item)) {
+        begin = item->valuestring;
+        end = begin + strlen(begin);
+        if (end - begin > 2 && begin[0] == '0' && (begin[1] == 'x' || begin[1] == 'X')) {
+            base = 16;
+            begin += 2;
+        }
+    } else if (cJSON_IsNumber(item)) {
+        const char *limit = line + length;
+        const char *p = skip_space(line, limit);
+        if (p == limit || *p++ != '{') return false;
+        while ((p = skip_space(p, limit)) < limit && *p == '"') {
+            const char *key = p++;
+            while (p < limit && *p != '"') { if (*p == '\\') ++p; ++p; }
+            if (p == limit) return false;
+            size_t key_len = (size_t)(p + 1 - key);
+            p = skip_space(p + 1, limit);
+            if (p == limit || *p++ != ':') return false;
+            p = skip_space(p, limit);
+            if (key_len == 11 && !memcmp(key, "\"arguments\"", 11)) {
+                if (p == limit || *p++ != '[') return false;
+                p = skip_space(skip_json_value(p, limit), limit);
+                if (p == limit || *p++ != ',') return false;
+                begin = skip_space(p, limit);
+                end = begin;
+                while (end < limit && *end >= '0' && *end <= '9') ++end;
+                p = skip_space(end, limit);
+                if (p == limit || (*p != ',' && *p != ']')) return false;
+                break;
+            }
+            p = skip_space(skip_json_value(p, limit), limit);
+            if (p == limit || *p++ != ',') break;
+        }
+    }
+    if (!begin || !end || begin == end) return false;
+    memset(out, 0, 32);
+    for (const char *p = begin; p < end; ++p) {
+        unsigned digit = *p >= '0' && *p <= '9' ? (unsigned)(*p - '0') :
+            *p >= 'a' && *p <= 'f' ? (unsigned)(*p - 'a' + 10) :
+            *p >= 'A' && *p <= 'F' ? (unsigned)(*p - 'A' + 10) : 255;
+        if (digit >= base) return false;
+        unsigned carry = digit;
+        for (unsigned j = 0; j < 32; ++j) {
+            carry += out[j] * base;
+            out[j] = (uint8_t)carry;
+            carry >>= 8;
+        }
+        if (carry) return false;
+    }
+    return true;
+}
+
 size_t dap_server_process(const char *line, size_t line_len, char *out, size_t out_size)
 {
-    (void)line_len;
     sb_t sb;
     sb_init(&sb, out, out_size);
 
-    cJSON *root = cJSON_Parse(line);
+    if (!line || !line_len || line_len >= DAP_JSON_BUF) {
+        resp_err(&sb, -1, STATUS_GENERAL, "invalid request size");
+        return sb.len;
+    }
+    cJSON *root = cJSON_ParseWithLength(line, line_len);
     if (root == NULL) {
         resp_err(&sb, -1, STATUS_GENERAL, "invalid json");
         return sb.len;
@@ -344,23 +446,12 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
         }
     } else if (strcmp(name, "swj_sequence") == 0) {
         int64_t count = 0;
-        if (!arg_int(args, 0, &count)) {
+        uint8_t buf[32];
+        if (!arg_int(args, 0, &count) || count < 1 || count > 256 ||
+            !parse_swj_bits(line, line_len, args, buf)) {
             resp_err(&sb, id, STATUS_GENERAL, "bad swj_sequence arguments");
         } else {
-            cJSON *jbits = cJSON_GetArrayItem(args, 1);
-            uint32_t bit_count = (count <= 0 || count > 256) ? 256u : (uint32_t)count;
-            uint8_t buf[32] = {0};
-            uint32_t nbytes = (bit_count + 7u) / 8u;
-            double dval = cJSON_IsNumber(jbits) ? jbits->valuedouble : 0.0;
-            if (dval >= 18446744073709551616.0) {
-                /* 超出 double 精度（>2^64），按全 1 处理（线复位就是这样） */
-                memset(buf, 0xFF, sizeof(buf));
-            } else {
-                uint64_t v = (uint64_t)dval;
-                for (uint32_t i = 0; i < nbytes; ++i) {
-                    buf[i] = (i < 8) ? (uint8_t)(v >> (8 * i)) : 0xFF;
-                }
-            }
+            uint32_t bit_count = (uint32_t)count;
             probe_swj_sequence(bit_count, buf);
             ESP_LOGD(TAG, "swj_sequence %u bits", (unsigned)bit_count);
             resp_ok(&sb, id);
@@ -440,7 +531,7 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
             resp_err(&sb, id, STATUS_GENERAL, "bad arguments");
         }
     } else if (strcmp(name, "read_ap_multiple") == 0) {
-        if (arg_int(args, 0, &a) && arg_int(args, 1, &b) && b > 0 && b <= MAX_BLOCK_WORDS) {
+        if (arg_int(args, 0, &a) && arg_int(args, 1, &b) && b > 0 && b <= MAX_BLOCK32_WORDS) {
             uint32_t addr = (uint32_t)a;
             probe_status_t st = select_ap_for_addr(addr);
             uint32_t n = (uint32_t)b;
@@ -479,13 +570,16 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
         if (arg_int(args, 0, &a) && arg_int(args, 1, &b)) {
             int64_t version = a;
             uint32_t nominal = (uint32_t)b;
-            if (version != 1 && version != 2) {
-                resp_err(&sb, id, STATUS_GENERAL, "invalid AP version");
+            if (version != 1 || b < 0 || b > 255) {
+                resp_err(&sb, id, STATUS_GENERAL, "only APv1 APSEL 0..255 is supported");
             } else {
-                uint32_t apsel = (nominal >> 24) & 0xFFu;
+                uint32_t apsel = nominal;
                 int handle = -1;
                 for (int i = 0; i < MAX_AP_HANDLES; ++i) {
-                    if (!s_handles[i].used) {
+                    if (s_handles[i].used && s_handles[i].apsel == apsel) { handle = i; break; }
+                }
+                for (int i = 0; i < MAX_AP_HANDLES; ++i) {
+                    if (handle < 0 && !s_handles[i].used) {
                         s_handles[i].used = true;
                         s_handles[i].apsel = apsel;
                         handle = i;
@@ -615,16 +709,11 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
         }
         int n = -1;
         if (arg_int(args, 1, &b)) {
-            n = parse_u32_array(args, 2, s_block, MAX_BLOCK_WORDS);
+            n = parse_byte_array(args, 2, s_bytes, MAX_BLOCK8_BYTES);
         }
         if (h == NULL || n <= 0) {
             resp_err(&sb, id, STATUS_GENERAL, "bad write_block8 arguments");
         } else {
-            for (int i = 0; i < n; ++i) {
-                if (i < (int)sizeof(s_bytes)) {
-                    s_bytes[i] = (uint8_t)s_block[i];
-                }
-            }
             probe_status_t st = select_ap(h->apsel);
             if (st == PROBE_OK) {
                 st = probe_mem_write_block8((uint32_t)b, s_bytes, (uint32_t)n);

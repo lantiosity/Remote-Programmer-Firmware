@@ -18,6 +18,11 @@ extern "C" {
 
 /** 建议的响应缓冲大小（read_block32 的 JSON 文本可能很大） */
 #define DAP_JSON_BUF 20480
+/* Reserve the largest id/status/result envelope and NUL. Decimal uint32
+ * elements need at most 10 digits + comma; bytes need 3 digits + comma. */
+#define DAP_JSON_HEADER_BUDGET 64
+#define DAP_MAX_READ_WORDS ((DAP_JSON_BUF - DAP_JSON_HEADER_BUDGET) / 11)
+#define DAP_MAX_READ_BYTES ((DAP_JSON_BUF - DAP_JSON_HEADER_BUDGET) / 4)
 
 /**
  * 处理一条请求（不含结尾换行）。
