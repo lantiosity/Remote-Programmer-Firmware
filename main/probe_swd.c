@@ -167,6 +167,16 @@ esp_err_t probe_swd_set_spi(bool enabled)
         esp_err_t err = swd_spi_prepare(s_clk, s_dio, s_clock_hz);
         if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) return err;
     }
+    if (!enabled) {
+        swd_spi_deinit();
+        /* spi_bus_free disables output drivers; restore the GPIO backend. */
+        if (s_clk >= 0 && s_dio >= 0) {
+            esp_rom_gpio_connect_out_signal(s_clk, SIG_GPIO_OUT_IDX, false, false);
+            esp_rom_gpio_connect_out_signal(s_dio, SIG_GPIO_OUT_IDX, false, false);
+            (void)gpio_set_direction(s_clk, GPIO_MODE_INPUT_OUTPUT);
+            (void)gpio_set_direction(s_dio, GPIO_MODE_INPUT_OUTPUT);
+        }
+    }
     s_spi_selected = enabled;
     return ESP_OK;
 }
@@ -295,7 +305,10 @@ static void update_timing(uint32_t hz)
 esp_err_t probe_swd_init(const swd_pins_t *pins)
 {
     if (pins == NULL || pins->clk_gpio < 0 || pins->dio_gpio < 0 ||
-        pins->clk_gpio >= SOC_GPIO_PIN_COUNT || pins->dio_gpio >= SOC_GPIO_PIN_COUNT ||
+        pins->clk_gpio >= 32 || pins->dio_gpio >= 32 ||
+        pins->clk_gpio == pins->dio_gpio || pins->clk_gpio == pins->nrst_gpio ||
+        pins->dio_gpio == pins->nrst_gpio ||
+        !GPIO_IS_VALID_OUTPUT_GPIO(pins->clk_gpio) || !GPIO_IS_VALID_OUTPUT_GPIO(pins->dio_gpio) ||
         (pins->nrst_gpio >= 0 && pins->nrst_gpio >= SOC_GPIO_PIN_COUNT)) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -304,6 +317,7 @@ esp_err_t probe_swd_init(const swd_pins_t *pins)
     }
     probe_swd_leave_fast();
     swd_spi_deinit();
+    s_spi_selected = false;
     if (s_fast_out) {
         fast_release();
     }
@@ -531,6 +545,13 @@ uint8_t probe_swd_transfer(uint8_t request, uint32_t *data)
 {
     if (s_spi_selected) {
         if (s_clock_hz < SWD_SPI_MIN_HZ) {
+            return transfer_regular(request, data);
+        }
+        swd_spi_stats_t stats;
+        swd_spi_get_stats(&stats);
+        if (!stats.ready) {
+            ESP_LOGW(TAG, "SPI2 unavailable; falling back to GPIO (re-enable with swdspi on)");
+            (void)probe_swd_set_spi(false);
             return transfer_regular(request, data);
         }
         uint8_t ack = swd_spi_transfer(request, data, s_turn_cycles, s_idle_cycles,

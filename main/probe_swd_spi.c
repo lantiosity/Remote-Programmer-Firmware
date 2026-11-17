@@ -3,6 +3,10 @@
  * SPI0/1 (Flash/PSRAM) are never touched. Existing GPIO4/5 wiring is retained.
  */
 #include <string.h>
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION_MAJOR != 6 || ESP_IDF_VERSION_MINOR != 1
+#error "SPI2 LL backend requires ESP-IDF 6.1; revalidate before changing SDK"
+#endif
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_cpu.h"
@@ -158,6 +162,7 @@ void swd_spi_deinit(void)
         s_hw = NULL;
     }
     s_stats.ready = false;
+    s_stats.actual_hz = 0;
     s_calibrated = false;
 }
 
