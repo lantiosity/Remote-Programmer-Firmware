@@ -41,6 +41,24 @@ lib = ctypes.CDLL(str(library))
 lib.dap_server_process.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
 lib.dap_server_process.restype = ctypes.c_size_t
 
+# Compile the real MEM-AP implementation against a posted-read / 1 KiB TAR
+# model. This detects corruption that an implementation-shaped memcpy mock
+# would miss, including reads/writes crossing the auto-increment boundary.
+swd_backend = (ROOT / 'tests/native/swd_backend.c').read_text(encoding='utf-8')
+swd_header = (ROOT / 'main/include/probe_swd.h').read_text(encoding='utf-8')
+swd_stubs = []
+for result, name, args in re.findall(r'\b(esp_err_t|bool|int|uint32_t|uint8_t|void)\s+(probe_\w+)\(([^;{}]*)\)\s*;', swd_header):
+    if re.search(r'\b' + name + r'\s*\(', swd_backend):
+        continue
+    swd_stubs.append(f'{result} {name}({args}) {{' + ('' if result == 'void' else ' return 0;') + ' }')
+(BUILD / 'swd_backend.c').write_text(swd_backend + '\n' + '\n'.join(swd_stubs), encoding='utf-8')
+core_library = BUILD / ('core.dll' if os.name == 'nt' else 'core.so')
+subprocess.run([GCC, '-shared', '-fPIC', *(['-Wl,--export-all-symbols'] if os.name == 'nt' else []),
+                '-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-parameter',
+                '-I'+str(ROOT/'tests/native/include'),'-I'+str(ROOT/'main/include'),
+                str(ROOT/'main/probe_core.c'),str(BUILD/'swd_backend.c'),'-o',str(core_library)], check=True)
+core = ctypes.CDLL(str(core_library))
+
 
 def counter(name):
     return ctypes.c_uint.in_dll(lib, name).value
@@ -130,6 +148,52 @@ class RemoteTests(unittest.TestCase):
         text = '{"ignored":{"arguments":[0,1]},"text":"\\\"arguments\\\"","request":"swj_sequence","arguments":[51,72057594037927935],"id":9}'
         self.assertEqual(request('',[],raw=text)['status'],0)
         self.assertEqual(bytes((ctypes.c_uint8*8192).in_dll(lib,'test_data'))[:7],b'\xff'*7)
+
+
+class MemoryTests(unittest.TestCase):
+    def setUp(self):
+        self.memory = (ctypes.c_uint8 * 16384).in_dll(core, 'model_memory')
+        self.memory[:] = bytes(i % 251 for i in range(16384))
+        ctypes.c_uint.in_dll(core,'model_fault').value = 0
+        ctypes.c_uint.in_dll(core,'model_transfers').value = 0
+        ctypes.c_uint32.in_dll(core,'model_csw').value = 0x23000052
+        core.probe_disconnect()
+        self.assertEqual(core.probe_mem_select_ap(0,0),0)
+
+    def test_unaligned_page_round_trip_and_neighbours(self):
+        for offset in [0,1,2,3,1021,1022,1023,1024]:
+            for size in [1,2,3,4,5,4096]:
+                original = bytes(self.memory)
+                payload = bytes((i * 17) % 256 for i in range(size))
+                data = (ctypes.c_uint8 * size).from_buffer_copy(payload)
+                self.assertEqual(core.probe_mem_write_block8(offset,data,size),0)
+                out = (ctypes.c_uint8 * size)()
+                self.assertEqual(core.probe_mem_read_block8(offset,out,size),0)
+                self.assertEqual(bytes(out),payload)
+                self.assertEqual(bytes(self.memory[:offset]),original[:offset])
+                self.assertEqual(bytes(self.memory[offset+size:]),original[offset+size:])
+                self.assertEqual(ctypes.c_uint32.in_dll(core,'model_csw').value & 0xffffffc0,0x23000040)
+
+    def test_word_transfer_crosses_tar_boundary(self):
+        data = (ctypes.c_uint32 * 1024)(*(i * 12347 for i in range(1024)))
+        self.assertEqual(core.probe_mem_write_block32(1020,data,1024),0)
+        out = (ctypes.c_uint32 * 1024)()
+        self.assertEqual(core.probe_mem_read_block32(1020,out,1024),0)
+        self.assertEqual(list(data),list(out))
+
+    def test_errors_and_address_overflow(self):
+        data = (ctypes.c_uint32 * 4)()
+        self.assertNotEqual(core.probe_mem_read_block32(1,data,1),0)
+        self.assertNotEqual(core.probe_mem_write_block32(-4,data,2),0)
+        self.assertNotEqual(core.probe_mem_read_block8(-1,data,2),0)
+        ctypes.c_uint.in_dll(core,'model_fault').value = 1
+        self.assertNotEqual(core.probe_mem_read_block32(0,data,4),0)
+
+    def test_large_read_uses_batched_transactions(self):
+        data = (ctypes.c_uint8 * 4096)()
+        self.assertEqual(core.probe_mem_read_block8(0,data,4096),0)
+        self.assertEqual(bytes(data),bytes(self.memory[:4096]))
+        self.assertLess(ctypes.c_uint.in_dll(core,'model_transfers').value,1200)
 
 
 if __name__ == '__main__':

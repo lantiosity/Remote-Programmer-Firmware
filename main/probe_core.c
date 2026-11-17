@@ -540,92 +540,98 @@ probe_status_t probe_mem_write(uint32_t addr, uint32_t size, uint32_t value)
     return probe_ap_write(AP_DRW, data);
 }
 
+/* ADIv5 guarantees at least 10 TAR auto-increment bits. Reprogram TAR at
+ * every 1 KiB boundary; larger target-specific windows are not assumed. */
 probe_status_t probe_mem_read_block32(uint32_t addr, uint32_t *data, uint32_t words)
 {
-    if (words == 0) {
-        return PROBE_OK;
+    if ((addr & 3u) || (words && !data) || (uint64_t)addr + (uint64_t)words * 4 > 0x100000000ULL)
+        return PROBE_ERR_ARG;
+    while (words) {
+        uint32_t count = (1024u - (addr & 1023u)) / 4;
+        if (count > words) count = words;
+        probe_status_t st = mem_setup(addr, 32, true);
+        if (st != PROBE_OK) return st;
+        uint32_t done = 0;
+        uint8_t ack = probe_transfer_block(make_request(true, true, AP_DRW), data, count, &done);
+        if (ack != SWD_ACK_OK) return ack_to_status(ack);
+        if (done != count) return PROBE_ERR_FAULT;
+        data += count;
+        addr += count * 4;
+        words -= count;
     }
-    probe_status_t st = mem_setup(addr, 32, true);
-    if (st != PROBE_OK) {
-        return st;
-    }
-    uint32_t request = make_request(true, true, AP_DRW);
-    uint32_t done = 0;
-    uint8_t ack = probe_transfer_block(request, data, words, &done);
-    if (ack != SWD_ACK_OK) {
-        return ack_to_status(ack);
-    }
-    return (done == words) ? PROBE_OK : PROBE_ERR_FAULT;
+    return PROBE_OK;
 }
 
 probe_status_t probe_mem_write_block32(uint32_t addr, const uint32_t *data, uint32_t words)
 {
-    if (words == 0) {
-        return PROBE_OK;
-    }
-    probe_status_t st = mem_setup(addr, 32, true);
-    if (st != PROBE_OK) {
-        return st;
-    }
-    uint32_t request = make_request(true, false, AP_DRW);
-    for (uint32_t i = 0; i < words; ++i) {
-        uint32_t v = data[i];
-        uint8_t ack = probe_transfer(request, &v);
-        if (ack != SWD_ACK_OK) {
-            return ack_to_status(ack);
+    if ((addr & 3u) || (words && !data) || (uint64_t)addr + (uint64_t)words * 4 > 0x100000000ULL)
+        return PROBE_ERR_ARG;
+    while (words) {
+        uint32_t count = (1024u - (addr & 1023u)) / 4;
+        if (count > words) count = words;
+        probe_status_t st = mem_setup(addr, 32, true);
+        if (st != PROBE_OK) return st;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t value = data[i];
+            uint8_t ack = probe_transfer(make_request(true, false, AP_DRW), &value);
+            if (ack != SWD_ACK_OK) return ack_to_status(ack);
         }
+        st = probe_mem_flush();
+        if (st != PROBE_OK) return st;
+        data += count;
+        addr += count * 4;
+        words -= count;
     }
     return PROBE_OK;
 }
 
 probe_status_t probe_mem_read_block8(uint32_t addr, uint8_t *data, uint32_t bytes)
 {
-    uint32_t done = 0;
-    while (done < bytes) {
-        uint32_t a = addr + done;
-        uint32_t base = a & ~0x03u;
-        uint32_t word = 0;
-        probe_status_t st = probe_mem_read(base, 32, &word);
-        if (st != PROBE_OK) {
-            return st;
+    if ((bytes && !data) || (uint64_t)addr + bytes > 0x100000000ULL) return PROBE_ERR_ARG;
+    uint32_t words[64];
+    while (bytes) {
+        probe_status_t st;
+        if ((addr & 3u) || bytes < 4) {
+            uint32_t value = 0;
+            st = probe_mem_read(addr, 8, &value);
+            if (st != PROBE_OK) return st;
+            *data++ = (uint8_t)value;
+            ++addr; --bytes;
+            continue;
         }
-        uint32_t off = a - base;              /* 0..3，非对齐起始要跳过前面的字节 */
-        for (uint32_t i = off; i < 4u && done < bytes; ++i, ++done) {
-            data[done] = (uint8_t)(word >> (i << 3));
-        }
+        uint32_t count = bytes / 4;
+        if (count > 64) count = 64;
+        st = probe_mem_read_block32(addr, words, count);
+        if (st != PROBE_OK) return st;
+        for (uint32_t i = 0; i < count * 4; ++i)
+            data[i] = (uint8_t)(words[i / 4] >> ((i & 3u) * 8));
+        data += count * 4; addr += count * 4; bytes -= count * 4;
     }
     return PROBE_OK;
 }
 
 probe_status_t probe_mem_write_block8(uint32_t addr, const uint8_t *data, uint32_t bytes)
 {
-    uint32_t offset = 0;
-    while (offset < bytes) {
-        uint32_t base = (addr + offset) & ~0x03u;
-        uint32_t word = 0;
-        uint32_t chunk = bytes - offset;
-        if (chunk > 4) {
-            chunk = 4;
-        }
-        if (chunk == 4 && (base == (addr + offset))) {
-            memcpy(&word, &data[offset], 4);
-            probe_status_t st = probe_mem_write(base, 32, word);
-            if (st != PROBE_OK) {
-                return st;
-            }
-            offset += 4;
+    if ((bytes && !data) || (uint64_t)addr + bytes > 0x100000000ULL) return PROBE_ERR_ARG;
+    uint32_t words[64];
+    while (bytes) {
+        probe_status_t st;
+        if ((addr & 3u) || bytes < 4) {
+            st = probe_mem_write(addr, 8, *data);
+            if (st != PROBE_OK) return st;
+            ++data; ++addr; --bytes;
             continue;
         }
-        for (uint32_t i = 0; i < chunk; ++i) {
-            uint32_t a = addr + offset + i;
-            probe_status_t st = probe_mem_write(a, 8, data[offset + i]);
-            if (st != PROBE_OK) {
-                return st;
-            }
-        }
-        offset += chunk;
+        uint32_t count = bytes / 4;
+        if (count > 64) count = 64;
+        for (uint32_t i = 0; i < count; ++i)
+            words[i] = (uint32_t)data[i*4] | (uint32_t)data[i*4+1] << 8 |
+                       (uint32_t)data[i*4+2] << 16 | (uint32_t)data[i*4+3] << 24;
+        st = probe_mem_write_block32(addr, words, count);
+        if (st != PROBE_OK) return st;
+        data += count * 4; addr += count * 4; bytes -= count * 4;
     }
-    return PROBE_OK;
+    return probe_mem_flush();
 }
 
 probe_status_t probe_mem_flush(void)
