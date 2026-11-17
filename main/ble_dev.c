@@ -3,6 +3,10 @@
  * @brief  BLE 链路（NimBLE）：DAP JSON 桥 + NUS 虚拟串口。
  */
 #include <string.h>
+#include <stdlib.h>
+#include <stdatomic.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "host/ble_att.h"
@@ -57,7 +61,9 @@ static bool     s_ready;
 
 static uint8_t s_rx[DAP_JSON_BUF];
 static size_t  s_rx_len;
-static uint8_t s_tx[DAP_JSON_BUF + 2];
+static bool s_rx_failed;
+static atomic_int s_token = ATOMIC_VAR_INIT(-1);
+static uint16_t s_epoch;
 
 static void uuid128_init(ble_uuid128_t *u, const uint8_t be[16])
 {
@@ -69,114 +75,94 @@ static void uuid128_init(ble_uuid128_t *u, const uint8_t be[16])
 
 /* ---------------- 收发 ---------------- */
 
-/* ------------------------------------------------------------------
- * 通知必须在 NimBLE host 任务里发（ble_gatts_notify_custom 非线程安全）。
- * 生产者只把数据投进 s_q_buf 并投递一个 npl 事件，真正发送在 host 任务里做。
- * ------------------------------------------------------------------ */
+/* Producers transfer ownership of each immutable packet to the queue. The
+ * NimBLE host sends ONE fragment per event; retries are timer-driven, never
+ * vTaskDelay() in the host. Generation tokens reject stale connection handles. */
+typedef struct {
+    int token;
+    uint16_t handle;
+    size_t len, offset;
+    unsigned retries;
+    uint8_t data[];
+} notify_packet_t;
+static QueueHandle_t s_tx_queue;
 static struct ble_npl_event s_tx_ev;
-static uint8_t  s_q_buf[DAP_JSON_BUF + 2];
-static volatile size_t   s_q_len;
-static volatile uint16_t s_q_conn;
-static volatile uint16_t s_q_handle;
-static volatile bool     s_q_pending;
-static SemaphoreHandle_t s_q_mtx;
+static struct ble_npl_callout s_tx_retry;
+static notify_packet_t *s_active;
+static atomic_int s_overflow = ATOMIC_VAR_INIT(-1);
 
 static void ble_tx_worker(struct ble_npl_event *ev)
 {
     (void)ev;
-    if (!s_q_pending) {
-        return;
+    int token = atomic_load(&s_token);
+    if (atomic_exchange(&s_overflow, -1) == token && token >= 0) {
+        (void)ble_gap_terminate((uint16_t)token, BLE_ERR_REM_USER_CONN_TERM);
     }
-    const uint16_t conn = s_q_conn;
-    const uint16_t handle = s_q_handle;
-    const uint8_t *data = s_q_buf;
-    size_t len = s_q_len;
-    s_q_pending = false;
-
-    if (conn == BLE_HS_CONN_HANDLE_NONE || handle == 0 || len == 0) {
-        return;
+    while (!s_active || s_active->token != token) {
+        free(s_active);
+        s_active = NULL;
+        if (xQueueReceive(s_tx_queue, &s_active, 0) != pdTRUE) return;
     }
-
+    uint16_t conn = (uint16_t)token;
     uint16_t mtu = ble_att_mtu(conn);
-    size_t chunk = (mtu > 3) ? (size_t)(mtu - 3) : 20;
-    if (chunk > 240) {
-        chunk = 240;
+    size_t chunk = mtu > 3 ? mtu - 3 : 20;
+    if (chunk > 240) chunk = 240;
+    size_t n = s_active->len - s_active->offset;
+    if (n > chunk) n = chunk;
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(s_active->data + s_active->offset, (uint16_t)n);
+    int rc = om ? ble_gatts_notify_custom(conn, s_active->handle, om) : BLE_HS_ENOMEM;
+    /* NimBLE consumes om on both success and failure. */
+    if (!rc) {
+        s_active->offset += n;
+        s_active->retries = 0;
+    } else if (rc != BLE_HS_ENOMEM || ++s_active->retries > 200) {
+        ESP_LOGW(TAG, "BLE notify failed rc=%d; closing incomplete stream", rc);
+        (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
+        free(s_active);
+        s_active = NULL;
+        return;
     }
-
-    while (len > 0) {
-        size_t n = (len > chunk) ? chunk : len;
-        int rc = BLE_HS_ENOMEM;
-        for (int retry = 0; retry < 40; ++retry) {
-            struct os_mbuf *om = ble_hs_mbuf_from_flat(data, (uint16_t)n);
-            if (om == NULL) {
-                vTaskDelay(1);
-                continue;
-            }
-            rc = ble_gatts_notify_custom(conn, handle, om);
-            if (rc == 0) {
-                break;
-            }
-            /* notify_custom consumes om on success and failure alike. */
-            if (rc != BLE_HS_ENOMEM) {
-                break;              /* 连接已断等，放弃剩余数据 */
-            }
-            vTaskDelay(1);          /* 背压：等控制器回收 ACL 缓冲 */
-        }
-        if (rc != 0) {
-            ESP_LOGW(TAG, "通知发送失败 rc=%d，丢弃剩余 %u 字节", rc, (unsigned)len);
-            break;
-        }
-        data += n;
-        len -= n;
-    }
+    if (s_active->offset == s_active->len) { free(s_active); s_active = NULL; }
+    (void)ble_npl_callout_reset(&s_tx_retry, ble_npl_time_ms_to_ticks32(1));
 }
 
-static bool notify_enqueue(uint16_t conn, uint16_t handle, const uint8_t *data, size_t len)
+static bool notify_enqueue(int token, uint16_t handle, const uint8_t *data, size_t len, bool dap)
 {
-    if (!s_ready || conn == BLE_HS_CONN_HANDLE_NONE || handle == 0 ||
-        data == NULL || len == 0 || s_q_mtx == NULL) {
+    if (!s_ready || token < 0 || token != atomic_load(&s_token) || !handle ||
+        !data || !len || len > DAP_JSON_BUF || !s_tx_queue) return false;
+    notify_packet_t *packet = malloc(sizeof(*packet) + len + (dap ? 1 : 0));
+    if (!packet) {
+        link_note_drop();
+        if (dap) {
+            atomic_store(&s_overflow, token);
+            ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
+        }
         return false;
     }
-    if (len > sizeof(s_q_buf)) {
-        len = sizeof(s_q_buf);
-    }
-    if (xSemaphoreTake(s_q_mtx, pdMS_TO_TICKS(50)) != pdTRUE) {
+    *packet = (notify_packet_t){.token=token, .handle=handle, .len=len + (dap ? 1 : 0)};
+    memcpy(packet->data, data, len);
+    if (dap) packet->data[len] = '\n';
+    if (xQueueSend(s_tx_queue, &packet, dap ? pdMS_TO_TICKS(200) : 0) != pdTRUE) {
+        free(packet);
+        link_note_drop();
+        if (dap) {
+            atomic_store(&s_overflow, token);
+            ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
+        }
         return false;
     }
-    if (s_q_pending) {
-        xSemaphoreGive(s_q_mtx);
-        return false;               /* 上一批还没发完，让上位机超时重试 */
-    }
-    memcpy(s_q_buf, data, len);
-    s_q_len = len;
-    s_q_conn = conn;
-    s_q_handle = handle;
-    s_q_pending = true;
-    xSemaphoreGive(s_q_mtx);
-
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
     return true;
 }
 
-bool ble_dap_send(int conn, const uint8_t *data, size_t len)
+bool ble_dap_send(int token, const uint8_t *data, size_t len)
 {
-    if (!s_ready) {
-        return false;
-    }
-    if (len > DAP_JSON_BUF) {
-        len = DAP_JSON_BUF;
-    }
-    memcpy(s_tx, data, len);
-    s_tx[len++] = '\n';
-    return notify_enqueue((uint16_t)conn, s_dap_tx_handle, s_tx, len);
+    return notify_enqueue(token, s_dap_tx_handle, data, len, true);
 }
 
-bool ble_serial_send(int conn, const uint8_t *data, size_t len)
+bool ble_serial_send(int token, const uint8_t *data, size_t len)
 {
-    if (!s_ready) {
-        return false;
-    }
-    return notify_enqueue((uint16_t)conn, s_nus_tx_handle, data, len);
+    return notify_enqueue(token, s_nus_tx_handle, data, len, false);
 }
 
 static bool ble_serial_sink(int opaque, const uint8_t *data, size_t len)
@@ -187,11 +173,13 @@ static bool ble_serial_sink(int opaque, const uint8_t *data, size_t len)
 
 static void dap_input(const uint8_t *data, size_t len)
 {
-    if (len > sizeof(s_rx)) {
+    if (s_rx_failed) return;
+    if (len >= sizeof(s_rx) || s_rx_len + len >= sizeof(s_rx)) {
+        s_rx_failed = true;
+        s_rx_len = 0;
+        atomic_store(&s_overflow, atomic_load(&s_token));
+        ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
         return;
-    }
-    if (s_rx_len + len > sizeof(s_rx)) {
-        s_rx_len = 0;   /* 溢出丢弃 */
     }
     memcpy(s_rx + s_rx_len, data, len);
     s_rx_len += len;
@@ -204,7 +192,10 @@ static void dap_input(const uint8_t *data, size_t len)
                 --l;
             }
             if (l > 0) {
-                link_submit(LINK_SINK_BLE, s_conn, s_rx + start, l);
+                if (link_submit(LINK_SINK_BLE, atomic_load(&s_token), s_rx + start, l) != ESP_OK) {
+                    atomic_store(&s_overflow, atomic_load(&s_token));
+                    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
+                }
             }
             start = i + 1;
         }
@@ -220,7 +211,7 @@ static void dap_input(const uint8_t *data, size_t len)
 static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
                        struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    (void)conn_handle;
+    if (conn_handle != s_conn) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
     (void)attr_handle;
     const int kind = (int)(intptr_t)arg;
 
@@ -229,7 +220,7 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
         uint16_t total = OS_MBUF_PKTLEN(ctxt->om);
         uint8_t tmp[512];
         if (total > sizeof(tmp)) {
-            total = sizeof(tmp);
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
         if (os_mbuf_copydata(ctxt->om, 0, total, tmp) != 0) {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
@@ -306,9 +297,17 @@ static int gap_event(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
+            if (s_conn != BLE_HS_CONN_HANDLE_NONE) {
+                (void)ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                return 0;
+            }
             s_conn = event->connect.conn_handle;
+            int token = (int)s_conn | (int)((++s_epoch & 0x7fffu) << 16);
+            atomic_store(&s_token, token);
+            link_session_set(LINK_SINK_BLE, token);
             s_rx_len = 0;
-            serial_bridge_subscribe(ble_serial_sink, (int)s_conn);
+            s_rx_failed = false;
+            serial_bridge_subscribe(ble_serial_sink, atomic_load(&s_token));
             ESP_LOGI(TAG, "BLE 已连接 (conn=%d)", s_conn);
         } else {
             advertise();
@@ -319,7 +318,11 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         ESP_LOGI(TAG, "BLE 断开 (reason=%d)", event->disconnect.reason);
         ble_ota_disconnected(event->disconnect.conn.conn_handle);
         wifi_setup_disconnected(event->disconnect.conn.conn_handle);
-        serial_bridge_unsubscribe(ble_serial_sink, (int)s_conn);
+        if (event->disconnect.conn.conn_handle != s_conn) return 0;
+        serial_bridge_unsubscribe(ble_serial_sink, atomic_load(&s_token));
+        atomic_store(&s_token, -1);
+        link_session_set(LINK_SINK_BLE, -1);
+        ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
         s_conn = BLE_HS_CONN_HANDLE_NONE;
         s_rx_len = 0;
         advertise();
@@ -411,9 +414,9 @@ esp_err_t ble_dev_init(void)
     ble_ota_enable_notifications();
 
     ble_npl_event_init(&s_tx_ev, ble_tx_worker, NULL);
-    if (s_q_mtx == NULL) {
-        s_q_mtx = xSemaphoreCreateMutex();
-    }
+    s_tx_queue = xQueueCreate(8, sizeof(notify_packet_t *));
+    if (!s_tx_queue) return ESP_ERR_NO_MEM;
+    ble_npl_callout_init(&s_tx_retry, nimble_port_get_dflt_eventq(), ble_tx_worker, NULL);
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
 
