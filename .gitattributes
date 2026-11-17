@@ -1,4 +1,7 @@
 * text=auto
 *.zip binary
+*.bin binary
 *.ico binary
 *.png binary
+# Preserve the exact packaged bytes so release SHA256 checks survive checkout.
+release/*/images/** -text
