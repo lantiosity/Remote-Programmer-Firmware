@@ -53,7 +53,7 @@ static void session_snapshot(int out[LINK_SINK_COUNT])
 
 void link_register_sender(link_sink_t sink, link_send_fn_t fn)
 {
-    if (sink < LINK_SINK_COUNT) {
+    if (sink >= 0 && sink < LINK_SINK_COUNT) {
         s_senders[sink] = fn;
     }
 }

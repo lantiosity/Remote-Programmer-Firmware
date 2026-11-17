@@ -112,8 +112,8 @@ static atomic_uint s_usb_epoch;
 typedef struct { unsigned epoch; uint8_t data[DAP_PACKET_SIZE]; } hid_packet_t;
 static QueueHandle_t s_hid_tx;
 static void hid_tx_deferred(void *unused);
-static bool    s_cdc_dtr;
-static bool    s_cdc_rts;
+static atomic_bool s_cdc_dtr;
+static atomic_bool s_cdc_rts;
 
 /* ---------------- TinyUSB 回调 ---------------- */
 

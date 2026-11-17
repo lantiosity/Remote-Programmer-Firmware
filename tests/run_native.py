@@ -151,6 +151,13 @@ class RemoteTests(unittest.TestCase):
             self.assertNotEqual(request('swj_sequence',args)['status'],0)
             self.assertEqual(counter('test_calls'),before)
 
+    def test_malformed_requests_and_unsigned_arguments(self):
+        for raw in ['[]','{} true','{"request":"hello","arguments":[1]} trailing']:
+            self.assertNotEqual(request('',[],raw=raw)['status'],0)
+        for value in [-1,2**32,1.5]:
+            self.assertNotEqual(request('set_clock',[value])['status'],0)
+            self.assertNotEqual(request('read_mem',[value,0,32])['status'],0)
+
     def test_swj_token_skips_nested_and_quoted_fields(self):
         text = '{"ignored":{"arguments":[0,1]},"text":"\\\"arguments\\\"","request":"swj_sequence","arguments":[51,72057594037927935],"id":9}'
         self.assertEqual(request('',[],raw=text)['status'],0)

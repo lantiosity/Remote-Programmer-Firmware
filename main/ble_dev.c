@@ -57,7 +57,7 @@ static uint16_t s_nus_tx_handle;
 
 static uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t  s_own_addr_type;
-static bool     s_ready;
+static atomic_bool s_ready;
 
 static uint8_t s_rx[DAP_JSON_BUF];
 static size_t  s_rx_len;

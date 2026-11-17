@@ -160,8 +160,9 @@ static bool arg_int(cJSON *args, int idx, int64_t *out)
         return false;
     }
     double value = it->valuedouble;
-    if (!isfinite(value) || value < -9223372036854775808.0 ||
-        value >= 9223372036854775808.0 || trunc(value) != value) return false;
+    /* All numeric protocol arguments except SWJ bits are unsigned 32-bit
+     * values (addresses, data, handles, counts). Reject instead of wrapping. */
+    if (!isfinite(value) || value < 0 || value > UINT32_MAX || trunc(value) != value) return false;
     *out = (int64_t)value;
     return true;
 }
@@ -380,9 +381,11 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
         resp_err(&sb, -1, STATUS_GENERAL, "invalid request size");
         return sb.len;
     }
-    cJSON *root = cJSON_ParseWithLength(line, line_len);
-    if (root == NULL) {
+    const char *parsed_end = NULL;
+    cJSON *root = cJSON_ParseWithLengthOpts(line, line_len, &parsed_end, false);
+    if (root == NULL || !cJSON_IsObject(root) || skip_space(parsed_end, line + line_len) != line + line_len) {
         resp_err(&sb, -1, STATUS_GENERAL, "invalid json");
+        cJSON_Delete(root);
         return sb.len;
     }
 
@@ -420,7 +423,7 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
         probe_connect();
         resp_ok(&sb, id);
     } else if (strcmp(name, "close") == 0) {
-        probe_disconnect();
+        dap_server_reset_session();
         resp_ok(&sb, id);
     } else if (strcmp(name, "lock") == 0 || strcmp(name, "unlock") == 0) {
         resp_ok(&sb, id);
