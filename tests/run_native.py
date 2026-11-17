@@ -57,6 +57,7 @@ def request(name, args, ident=1, raw=None):
 
 class RemoteTests(unittest.TestCase):
     def setUp(self):
+        lib.dap_server_select_session(0)
         lib.dap_server_reset_session()
         ctypes.c_uint.in_dll(lib, 'test_calls').value = 0
         self.handle = request('get_memory_interface_for_ap', [1, 7])['result']
@@ -87,6 +88,20 @@ class RemoteTests(unittest.TestCase):
             self.assertEqual(request('get_memory_interface_for_ap', [1, 7])['result'], self.handle)
         for args in [[2, 0], [1, 256], [1, -1]]:
             self.assertNotEqual(request('get_memory_interface_for_ap', args)['status'], 0)
+
+    def test_sessions_are_isolated_and_handles_reclaimed(self):
+        lib.dap_server_select_session(1)
+        lib.dap_server_reset_handles()
+        ble = request('get_memory_interface_for_ap',[1,23])['result']
+        request('read_mem',[ble,0,32])
+        self.assertEqual(counter('test_apsel'),23)
+        lib.dap_server_select_session(0)
+        request('read_mem',[self.handle,0,32])
+        self.assertEqual(counter('test_apsel'),7)
+        lib.dap_server_select_session(1)
+        for _ in range(10):
+            lib.dap_server_reset_handles()
+            self.assertEqual(request('get_memory_interface_for_ap',[1,23])['status'],0)
 
     def test_largest_decimal_responses(self):
         for name, limit, value in [('read_block8', 5104, 255), ('read_block32', 1856, 2**32-1), ('read_ap_multiple',1856,0)]:

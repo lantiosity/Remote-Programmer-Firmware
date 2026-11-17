@@ -44,7 +44,8 @@ typedef struct {
     uint32_t apsel;
 } ap_handle_t;
 
-static ap_handle_t s_handles[MAX_AP_HANDLES];
+static ap_handle_t s_sessions[2][MAX_AP_HANDLES];
+static ap_handle_t *s_handles = s_sessions[0];
 
 /* ---------------- 字符串构建 ---------------- */
 
@@ -748,6 +749,16 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
 
 void dap_server_reset_session(void)
 {
-    memset(s_handles, 0, sizeof(s_handles));
+    dap_server_reset_handles();
     probe_disconnect();
+}
+
+void dap_server_select_session(unsigned session)
+{
+    if (session < 2) s_handles = s_sessions[session];
+}
+
+void dap_server_reset_handles(void)
+{
+    memset(s_handles, 0, sizeof(s_sessions[0]));
 }

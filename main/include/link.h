@@ -31,6 +31,9 @@ esp_err_t link_init(void);
 
 /** 提交一条请求（内部拷贝数据） */
 esp_err_t link_submit(link_sink_t sink, int opaque, const uint8_t *data, size_t len);
+/* Transport lifecycle: token includes the connection generation; -1 closes.
+ * Only dap_worker applies resets, including when its request queue is full. */
+void link_session_set(link_sink_t sink, int token);
 
 /** 统计信息 */
 typedef struct {

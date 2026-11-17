@@ -15,6 +15,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "lwip/sockets.h"
 
 #include "app_cfg.h"
@@ -40,6 +41,8 @@ static unsigned s_ap_clients, s_sta_failures, s_sta_retry_seconds;
 static volatile int s_dap_fd = -1;
 static volatile uint32_t s_dap_epoch = 0;   /* 每次连接自增，防止 fd 复用时写错连接 */
 static volatile int s_serial_fd = -1;
+static uint32_t s_serial_epoch;
+static SemaphoreHandle_t s_dap_send_lock, s_serial_send_lock;
 
 static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
@@ -118,23 +121,29 @@ static bool send_all(int fd, const uint8_t *data, size_t len)
 
 bool tcp_dap_send(int opaque, const uint8_t *data, size_t len)
 {
+    if (!s_dap_send_lock || xSemaphoreTake(s_dap_send_lock, pdMS_TO_TICKS(1100)) != pdTRUE) return false;
     /* 低 16 位是 fd，高 16 位是会话代号：fd 被复用也不会写错连接 */
     const int fd = opaque & 0xFFFF;
     const uint32_t epoch = ((uint32_t)opaque >> 16) & 0x7FFFu;
     if (fd < 0 || fd != s_dap_fd || epoch != (s_dap_epoch & 0x7FFFu)) {
+        xSemaphoreGive(s_dap_send_lock);
         return false;
     }
     /* 协议：一行一条 JSON，响应也要以 '\n' 结尾 */
     static const uint8_t nl = '\n';
-    return send_all(fd, data, len) && send_all(fd, &nl, 1);
+    bool ok = send_all(fd, data, len) && send_all(fd, &nl, 1);
+    xSemaphoreGive(s_dap_send_lock);
+    return ok;
 }
 
-bool tcp_serial_send(int fd, const uint8_t *data, size_t len)
+bool tcp_serial_send(int opaque, const uint8_t *data, size_t len)
 {
-    if (fd < 0) {
-        return false;
-    }
-    return send_all(fd, data, len);
+    if (!s_serial_send_lock || xSemaphoreTake(s_serial_send_lock, pdMS_TO_TICKS(1100)) != pdTRUE) return false;
+    int fd = opaque & 0xffff;
+    uint32_t epoch = (uint32_t)opaque >> 16;
+    bool ok = fd == s_serial_fd && epoch == (s_serial_epoch & 0x7fffu) && send_all(fd, data, len);
+    xSemaphoreGive(s_serial_send_lock);
+    return ok;
 }
 
 /* ---------------- DAP TCP 服务 ---------------- */
@@ -198,9 +207,12 @@ static void tcp_dap_task(void *arg)
                 continue;
             }
             tune_client_fd(fd);
+            xSemaphoreTake(s_dap_send_lock, portMAX_DELAY);
             s_dap_epoch++;
             s_dap_fd = fd;
-            dap_server_reset_session();
+            int token = fd | (int)((s_dap_epoch & 0x7fffu) << 16);
+            xSemaphoreGive(s_dap_send_lock);
+            link_session_set(LINK_SINK_TCP, token);
             ESP_LOGI(TAG, "DAP 客户端 %s:%d 已连接", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
 
             size_t used = 0;
@@ -222,8 +234,10 @@ static void tcp_dap_task(void *arg)
                         --len;
                     }
                     if (len > 0) {
-                        link_submit(LINK_SINK_TCP, fd | (int)((s_dap_epoch & 0x7FFFu) << 16),
-                        (const uint8_t *)start, len);
+                        if (link_submit(LINK_SINK_TCP, token, (const uint8_t *)start, len) != ESP_OK) {
+                            /* Terminate instead of silently losing a DAP response. */
+                            shutdown(fd, SHUT_RDWR);
+                        }
                     }
                     start = nl + 1;
                 }
@@ -234,9 +248,11 @@ static void tcp_dap_task(void *arg)
                 used = remain;
             }
             ESP_LOGI(TAG, "DAP 客户端断开");
+            link_session_set(LINK_SINK_TCP, -1);
+            xSemaphoreTake(s_dap_send_lock, portMAX_DELAY);
             s_dap_fd = -1;
             close(fd);
-            dap_server_reset_session();
+            xSemaphoreGive(s_dap_send_lock);
         }
     }
 }
@@ -293,8 +309,18 @@ static void tcp_serial_task(void *arg)
                 continue;
             }
             tune_client_fd(fd);
+            xSemaphoreTake(s_serial_send_lock, portMAX_DELAY);
             s_serial_fd = fd;
-            serial_bridge_subscribe(serial_tcp_sink, fd);
+            ++s_serial_epoch;
+            int token = fd | (int)((s_serial_epoch & 0x7fffu) << 16);
+            xSemaphoreGive(s_serial_send_lock);
+            if (serial_bridge_subscribe(serial_tcp_sink, token) != ESP_OK) {
+                xSemaphoreTake(s_serial_send_lock, portMAX_DELAY);
+                s_serial_fd = -1;
+                close(fd);
+                xSemaphoreGive(s_serial_send_lock);
+                continue;
+            }
             ESP_LOGI(TAG, "串口客户端 %s:%d 已连接", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
 
             for (;;) {
@@ -304,9 +330,11 @@ static void tcp_serial_task(void *arg)
                 }
                 serial_bridge_to_target(buf, (size_t)n);
             }
-            serial_bridge_unsubscribe(serial_tcp_sink, fd);
+            serial_bridge_unsubscribe(serial_tcp_sink, token);
+            xSemaphoreTake(s_serial_send_lock, portMAX_DELAY);
             s_serial_fd = -1;
             close(fd);
+            xSemaphoreGive(s_serial_send_lock);
             ESP_LOGI(TAG, "串口客户端断开");
         }
     }
@@ -316,6 +344,9 @@ static void tcp_serial_task(void *arg)
 
 esp_err_t net_dev_init(void)
 {
+    s_dap_send_lock = xSemaphoreCreateMutex();
+    s_serial_send_lock = xSemaphoreCreateMutex();
+    if (!s_dap_send_lock || !s_serial_send_lock) return ESP_ERR_NO_MEM;
     esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         return err;
@@ -394,8 +425,7 @@ esp_err_t net_dev_init(void)
     xTaskCreate(tcp_dap_task, "tcp_dap", 6144, NULL, 9, NULL);
     xTaskCreate(tcp_serial_task, "tcp_serial", 4096, NULL, 7, NULL);
 
-    ESP_LOGI(TAG, "热点: %s / %s，地址 %s", CONFIG_LINK_AP_SSID,
-             CONFIG_LINK_AP_PASSWORD, s_ap_ip);
+    ESP_LOGI(TAG, "热点: %s，地址 %s", CONFIG_LINK_AP_SSID, s_ap_ip);
     return ESP_OK;
 }
 

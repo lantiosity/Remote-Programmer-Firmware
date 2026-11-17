@@ -36,6 +36,9 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
 
 /** 主动断开当前"远端探针"会话状态（例如链路断开时） */
 void dap_server_reset_session(void);
+/* Worker-only: TCP and BLE have separate handle tables. */
+void dap_server_select_session(unsigned session);
+void dap_server_reset_handles(void);
 
 #ifdef __cplusplus
 }

@@ -32,6 +32,8 @@ static int         s_baud = 115200;
 
 esp_err_t serial_bridge_init(void)
 {
+    if (!s_sinks_mtx) s_sinks_mtx = xSemaphoreCreateMutex();
+    if (!s_sinks_mtx) return ESP_ERR_NO_MEM;
     s_port = (uart_port_t)cfg_uart_port();
     s_baud = cfg_uart_baud();
 
@@ -77,14 +79,11 @@ esp_err_t serial_bridge_subscribe(serial_sink_fn_t fn, int opaque)
     if (fn == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_sinks_mtx == NULL) {
-        s_sinks_mtx = xSemaphoreCreateMutex();
-    }
-    if (s_sinks_mtx) {
-        (void)xSemaphoreTake(s_sinks_mtx, portMAX_DELAY);
-    }
+    if (!s_sinks_mtx) return ESP_ERR_INVALID_STATE;
+    (void)xSemaphoreTake(s_sinks_mtx, portMAX_DELAY);
     for (int i = 0; i < SINK_MAX; ++i) {
         if (s_sinks[i].used && s_sinks[i].fn == fn && s_sinks[i].opaque == opaque) {
+            xSemaphoreGive(s_sinks_mtx);
             return ESP_OK;
         }
     }
@@ -107,13 +106,16 @@ esp_err_t serial_bridge_subscribe(serial_sink_fn_t fn, int opaque)
 
 void serial_bridge_unsubscribe(serial_sink_fn_t fn, int opaque)
 {
+    if (!s_sinks_mtx) return;
+    (void)xSemaphoreTake(s_sinks_mtx, portMAX_DELAY);
     for (int i = 0; i < SINK_MAX; ++i) {
         if (s_sinks[i].used && s_sinks[i].fn == fn && s_sinks[i].opaque == opaque) {
             s_sinks[i].used = false;
             s_sinks[i].fn = NULL;
-            return;
+            break;
         }
     }
+    xSemaphoreGive(s_sinks_mtx);
 }
 
 esp_err_t serial_bridge_set_baud(int baud)
