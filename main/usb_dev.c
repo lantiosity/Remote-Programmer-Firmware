@@ -8,6 +8,10 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdatomic.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "device/usbd_pvt.h"
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -103,7 +107,11 @@ static const char *s_string_desc[] = {
     "ESP-SWD Virtual COM",
 };
 
-static bool    s_mounted;
+static atomic_bool s_mounted;
+static atomic_uint s_usb_epoch;
+typedef struct { unsigned epoch; uint8_t data[DAP_PACKET_SIZE]; } hid_packet_t;
+static QueueHandle_t s_hid_tx;
+static void hid_tx_deferred(void *unused);
 static bool    s_cdc_dtr;
 static bool    s_cdc_rts;
 
@@ -140,7 +148,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
     if (bufsize > DAP_PACKET_SIZE) {
         bufsize = DAP_PACKET_SIZE;
     }
-    if (link_submit(LINK_SINK_USB, 0, buffer, bufsize) != ESP_OK) {
+    if (link_submit(LINK_SINK_USB, (int)atomic_load(&s_usb_epoch), buffer, bufsize) != ESP_OK) {
         ESP_LOGW(TAG, "HID 请求丢弃（队列满）");
     }
 }
@@ -151,11 +159,16 @@ static void usb_event_cb(tinyusb_event_t *event, void *arg)
     switch (event->id) {
     case TINYUSB_EVENT_ATTACHED:
         s_mounted = true;
+        link_session_set(LINK_SINK_USB, (int)atomic_fetch_add(&s_usb_epoch, 1) + 1);
+        usbd_defer_func(hid_tx_deferred, NULL, false);
         ESP_LOGI(TAG, "USB 已挂载：CMSIS-DAP(HID) + 虚拟串口(CDC)");
         break;
     case TINYUSB_EVENT_DETACHED:
         ble_ota_disconnected(OTA_OWNER_USB);
         s_mounted = false;
+        atomic_fetch_add(&s_usb_epoch, 1);
+        link_session_set(LINK_SINK_USB, -1);
+        xQueueReset(s_hid_tx);
         s_cdc_dtr = false;
         s_cdc_rts = false;
         ESP_LOGI(TAG, "USB 已断开");
@@ -176,15 +189,47 @@ static void cdc_line_state_cb(int itf, cdcacm_event_t *event)
 
 /* ---------------- 对外接口 ---------------- */
 
+/* Only this deferred callback and report completion run TinyUSB HID APIs. */
+static void hid_tx_deferred(void *unused)
+{
+    (void)unused;
+    hid_packet_t packet;
+    while (xQueuePeek(s_hid_tx, &packet, 0) == pdTRUE) {
+        if (!s_mounted || packet.epoch != atomic_load(&s_usb_epoch)) {
+            xQueueReceive(s_hid_tx, &packet, 0);
+            continue;
+        }
+        if (!tud_hid_ready()) return;  /* Completion callback resumes the queue. */
+        xQueueReceive(s_hid_tx, &packet, 0);
+        if (!tud_hid_report(0, packet.data, DAP_PACKET_SIZE)) link_note_drop();
+        return;
+    }
+}
+
+void tud_hid_report_complete_cb(uint8_t instance, const uint8_t *report, uint16_t len)
+{
+    (void)instance; (void)report; (void)len;
+    hid_tx_deferred(NULL);
+}
+
 static bool usb_hid_send_cb(int opaque, const uint8_t *data, size_t len)
 {
-    (void)opaque;
-    usb_dev_hid_send(data, len);
+    if (!s_hid_tx || !s_mounted || (unsigned)opaque != atomic_load(&s_usb_epoch) ||
+        !data || !len || len > DAP_PACKET_SIZE) return false;
+    hid_packet_t packet = {.epoch = (unsigned)opaque};
+    memcpy(packet.data, data, len);
+    if (xQueueSend(s_hid_tx, &packet, pdMS_TO_TICKS(100)) != pdTRUE) {
+        link_note_drop();
+        return false;
+    }
+    usbd_defer_func(hid_tx_deferred, NULL, false);
     return true;
 }
 
 esp_err_t usb_dev_init(void)
 {
+    s_hid_tx = xQueueCreate(8, sizeof(hid_packet_t));
+    if (!s_hid_tx) return ESP_ERR_NO_MEM;
     snprintf(s_serial_str, sizeof(s_serial_str), "%s", cfg_serial_number());
     link_register_sender(LINK_SINK_USB, usb_hid_send_cb);
 
@@ -238,32 +283,12 @@ esp_err_t usb_dev_init(void)
 
 bool usb_dev_hid_ready(void)
 {
-    return s_mounted && tud_hid_ready();
+    return s_mounted;
 }
 
 void usb_dev_hid_send(const uint8_t *data, size_t len)
 {
-    if (!s_mounted) {
-        return;
-    }
-    uint8_t buf[DAP_PACKET_SIZE];
-    memset(buf, 0, sizeof(buf));
-    if (len > sizeof(buf)) {
-        len = sizeof(buf);
-    }
-    memcpy(buf, data, len);
-
-    /* IN 端点忙时等一小会儿，避免吞掉上位机等待的响应 */
-    for (int i = 0; i < 20 && !tud_hid_ready(); ++i) {
-        vTaskDelay(1);
-    }
-    if (!tud_hid_ready()) {
-        ESP_LOGW(TAG, "HID IN 忙，丢弃一个响应");
-        link_note_drop();
-        return;
-    }
-    /* CMSIS-DAP v1 固定 64 字节报文 */
-    tud_hid_report(0, buf, DAP_PACKET_SIZE);
+    (void)usb_hid_send_cb((int)atomic_load(&s_usb_epoch), data, len);
 }
 
 bool usb_dev_cdc_connected(void)

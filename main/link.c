@@ -34,11 +34,11 @@ static link_send_fn_t   s_senders[LINK_SINK_COUNT];
 static link_stats_t     s_stats;
 static bool             s_started;
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
-static int s_sessions[LINK_SINK_COUNT] = {0, -1, -1};
+static int s_sessions[LINK_SINK_COUNT] = {-1, -1, -1};
 
 void link_session_set(link_sink_t sink, int token)
 {
-    if (sink <= LINK_SINK_USB || sink >= LINK_SINK_COUNT) return;
+    if (sink < LINK_SINK_USB || sink >= LINK_SINK_COUNT) return;
     portENTER_CRITICAL(&s_state_lock);
     s_sessions[sink] = token;
     portEXIT_CRITICAL(&s_state_lock);
@@ -62,7 +62,7 @@ static void link_worker(void *arg)
 {
     static char s_json_resp[DAP_JSON_BUF];
     (void)arg;
-    int seen[LINK_SINK_COUNT] = {0, -1, -1};
+    int seen[LINK_SINK_COUNT] = {-1, -1, -1};
     int owner = -1;
 
     for (;;) {
@@ -71,16 +71,18 @@ static void link_worker(void *arg)
         int sessions[LINK_SINK_COUNT];
         session_snapshot(sessions);
         probe_lock();
-        for (int sink = LINK_SINK_TCP; sink < LINK_SINK_COUNT; ++sink) {
+        for (int sink = LINK_SINK_USB; sink < LINK_SINK_COUNT; ++sink) {
             if (seen[sink] == sessions[sink]) continue;
-            dap_server_select_session((unsigned)(sink - LINK_SINK_TCP));
-            dap_server_reset_handles();
+            if (sink != LINK_SINK_USB) {
+                dap_server_select_session((unsigned)(sink - LINK_SINK_TCP));
+                dap_server_reset_handles();
+            }
             if (owner == sink) { probe_disconnect(); owner = -1; }
             seen[sink] = sessions[sink];
         }
         probe_unlock();
         if (!req) continue;
-        if (req->sink != LINK_SINK_USB && sessions[req->sink] != req->opaque) {
+        if (sessions[req->sink] != req->opaque) {
             free(req);
             continue;
         }

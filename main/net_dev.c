@@ -218,7 +218,7 @@ static void tcp_dap_task(void *arg)
             size_t used = 0;
             for (;;) {
                 if (used >= DAP_JSON_BUF) {
-                    used = 0;   /* 溢出保护 */
+                    break;  /* Never execute the suffix of an oversized JSON line. */
                 }
                 int n = recv(fd, buf + used, DAP_JSON_BUF - used, 0);
                 if (n <= 0) {
