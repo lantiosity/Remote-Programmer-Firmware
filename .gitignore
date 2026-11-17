@@ -18,3 +18,7 @@ managed_components/
 sdkconfig
 sdkconfig.old
 sdkconfig.*.old
+# Local review reports and cross-repository diagnostics are not release source.
+/docs/REVIEW_FIX_PLAN.md
+/docs/HOST_FIRMWARE_ALIGNMENT.md
+/tools/check-firmware-contract.py
