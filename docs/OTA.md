@@ -1,4 +1,4 @@
-# ESP32 自身升级（0.1.1）
+# ESP32 自身升级（0.1.2）
 
 USB（CMSIS-DAP HID 扩展）、WiFi 和 BLE 共用 OTA 状态机。升级对象为 `build/esp_swdlink.bin`，不是目标 MCU 固件。配套上位机在独立仓库维护。
 
@@ -18,7 +18,7 @@ USB（CMSIS-DAP HID 扩展）、WiFi 和 BLE 共用 OTA 状态机。升级对象
 
 ## 操作
 
-1. 选择发布包 `release/0.1.1/images/esp_swdlink.bin`，或自行构建的同名应用。
+1. 选择发布包 `release/0.1.2/images/esp_swdlink.bin`，或自行构建的同名应用。
 2. 停止其他烧录/调试任务，连接对应 USB、WiFi 或 BLE 链路。
 3. 运行状态下长按 BOOT 约 2 秒开放升级窗口，或在设备控制台执行 `ota arm`（默认 300 秒）。
 4. 在上位机的烧录器升级功能读取信息，再执行升级并等待设备重启。
@@ -38,3 +38,5 @@ SHA256 是完整性检查，当前协议不提供签名认证。授权窗口控�
 - USB OTA 请求仍在 DAP worker 中等待共享 OTA worker 提交，最长 15 秒，但这段等待不持有 SWD 总线锁；升级期间请停止其他烧录/调试任务。
 
 0.1.1 已完成构建和本机协议/内存/串口回归，本次未实测物理设备 OTA、配对和回滚。进入 ROM 下载模式进行完整安装的说明见 [README](../README.md#直接烧录发布固件无需编译)。
+
+0.1.2 中 OTA status 的 Flags bit0 及 ARMED 状态只反映当前查询链路；未授权链路返回未授权/IDLE，其他活动会话仍如实显示繁忙。控制台的状态保留全局视角。配网 status 的 armed 同样区分 USB/BLE，避免先前仅开放 USB 后无线预检查误通过。
