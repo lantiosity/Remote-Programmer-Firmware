@@ -58,14 +58,23 @@ static int cmd_ota(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "arm") == 0) {
         unsigned seconds = argc == 3 ? (unsigned)atoi(argv[2]) : 300;
-        if (argc > 3 || seconds == 0 || seconds > 600) return 1;
-        esp_err_t err = ble_ota_arm(seconds);
+        if (argc > 4 || seconds == 0 || seconds > 600) return 1;
+        if (argc >= 3) seconds = (unsigned)atoi(argv[2]);
+        unsigned mask = OTA_ALLOW_ALL;
+        if (argc == 4) {
+            if (!strcmp(argv[3], "usb")) mask = OTA_ALLOW_USB;
+            else if (!strcmp(argv[3], "wifi")) mask = OTA_ALLOW_WIFI;
+            else if (!strcmp(argv[3], "ble")) mask = OTA_ALLOW_BLE;
+            else if (strcmp(argv[3], "all")) return 1;
+        }
+        if (!seconds || seconds > 600) return 1;
+        esp_err_t err = ble_ota_arm_transport(seconds, mask);
         if (err != ESP_OK) { printf("OTA arm failed: %s\n", esp_err_to_name(err)); return 1; }
     } else if (argc == 2 && strcmp(argv[1], "off") == 0) {
         esp_err_t err = ble_ota_arm(0);
         if (err != ESP_OK) { printf("OTA busy: %s\n", esp_err_to_name(err)); return 1; }
     } else if (argc > 2 || (argc == 2 && strcmp(argv[1], "status") != 0)) {
-        printf("Usage: ota [status|arm [1..600]|off]\n"); return 1;
+        printf("Usage: ota [status|arm [1..600] [usb|wifi|ble|all]|off]\n"); return 1;
     }
     uint8_t status[20];
     char info[512];
@@ -86,7 +95,12 @@ static int cmd_wificfg(int argc, char **argv)
     }
     esp_err_t err = wifi_setup_submit(request, true);
     memset(request, 0, sizeof(request));
-    if (err != ESP_OK) { printf("WLWIFI {\"id\":\"%.8s\",\"ok\":false,\"error\":\"device_busy\"}\n", argv[1]); return 1; }
+    if (err != ESP_OK) {
+        const char *error = err == ESP_ERR_INVALID_ARG ? "invalid_request" :
+            err == ESP_ERR_INVALID_STATE ? "device_busy" : err == ESP_ERR_TIMEOUT ? "timeout" : "submit_failed";
+        printf("WLWIFI {\"id\":\"%.8s\",\"ok\":false,\"error\":\"%s\"}\n", argv[1], error);
+        return 1;
+    }
     char response[512];
     for (int i = 0; i < 300; ++i) {
         wifi_setup_response(response, sizeof(response));
@@ -195,8 +209,8 @@ static int cmd_swd(int argc, char **argv)
 {
     if (argc >= 2) {
         int khz = atoi(argv[1]);
-        if (khz < 100 || khz > 10000) {
-            printf("范围 100 ~ 10000 kHz\n");
+        if (khz < 100 || khz > 50000) {
+            printf("范围 100 ~ 50000 kHz\n");
             return 1;
         }
         probe_set_clock((uint32_t)khz * 1000u);
@@ -216,6 +230,7 @@ static int cmd_scan(int argc, char **argv)
     const size_t speed_count = emu ? (sizeof(speeds_emu) / sizeof(speeds_emu[0]))
                                    : (sizeof(speeds_fast) / sizeof(speeds_fast[0]));
     const uint32_t old_hz = probe_get_clock();
+    bool swapped = false;
 
     printf("连接目标…\n");
     for (size_t i = 0; i < speed_count; ++i) {
@@ -224,7 +239,7 @@ static int cmd_scan(int argc, char **argv)
         if (probe_idcode() != 0) {
             printf("发现 SWD 目标, DP IDCODE = 0x%08" PRIx32 " (SWD %" PRIu32 " kHz)\n",
                    probe_idcode(), speeds[i]);
-            return 0;
+            goto found;
         }
         printf("  %" PRIu32 " kHz: 无应答，重试…\n", speeds[i]);
     }
@@ -239,7 +254,7 @@ static int cmd_scan(int argc, char **argv)
         probe_assert_reset(false);
         if (id != 0) {
             printf(">>> 复位期间连上, DP IDCODE = 0x%08" PRIx32 "\n", id);
-            return 0;
+            goto found;
         }
         printf("复位期间仍无应答\n");
     }
@@ -247,14 +262,15 @@ static int cmd_scan(int argc, char **argv)
     /* 再试一次：交换 SWCLK/SWDIO（目标侧接反的情况很常见） */
     printf("尝试交换 SWCLK/SWDIO 引脚…\n");
     probe_swap_pins();
+    swapped = true;
     for (size_t i = 0; i < speed_count; ++i) {
         probe_set_clock(speeds[i] * 1000u);
         probe_connect();
         if (probe_idcode() != 0) {
             printf(">>> 交换引脚后连上了！DP IDCODE = 0x%08" PRIx32 " (SWD %" PRIu32 " kHz)\n",
                    probe_idcode(), speeds[i]);
-            printf("提示：目标侧 SWCLK/SWDIO 接反了，请对调后重新上电\n");
-            return 0;
+            printf("提示：目标侧 SWCLK/SWDIO 接反了；诊断结束将恢复原映射，请修正接线\n");
+            goto found;
         }
     }
     probe_swap_pins();   /* 恢复原引脚 */
@@ -265,6 +281,11 @@ static int cmd_scan(int argc, char **argv)
     printf("  - 确认目标 3.3V 供电、GND 共地、线没有松动\n");
     printf("  - 目标固件可能把 PA13/PA14 复用掉了，试试 swdreset\n");
     return 1;
+found:
+    if (swapped) probe_swap_pins();
+    probe_set_clock(old_hz);
+    printf("诊断完成，恢复原时钟 %" PRIu32 " kHz 和原引脚；交换引脚探测后的连接已释放\n", old_hz / 1000u);
+    return 0;
 }
 
 /* ---- 数据通路自检：用 CLK 上升沿中断采样本机 SWDIO 输出 ----
@@ -333,7 +354,6 @@ static int cmd_datachk(int argc, char **argv)
 {
     uint32_t byte = (argc >= 2) ? (uint32_t)strtoul(argv[1], NULL, 16) : 0xA5u;
     const int clk = cfg_probe()->swclk_gpio;
-    const int dio = cfg_probe()->swdio_gpio;
 
     esp_err_t err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
@@ -661,6 +681,37 @@ static int cmd_reboot(int argc, char **argv)
     return 0;
 }
 
+/* Optional scratch RAM is supplied by the operator; default selftest only
+ * reads AP IDR. Back up before writing and attempt restoration on any error. */
+static int cmd_selftest(int argc, char **argv)
+{
+    if (argc < 2 || argc > 3) { printf("Usage: selftest <APSEL> [halted-target-scratch-RAM-address]\n"); return 1; }
+    char *end;
+    unsigned long ap = strtoul(argv[1], &end, 0);
+    if (*end || ap > 255) return 1;
+    probe_status_t st = probe_mem_select_ap((uint32_t)ap, 0xf0);
+    uint32_t idr = 0;
+    if (st == PROBE_OK) st = probe_ap_read(0xfc, &idr);
+    printf("AP%lu IDR=0x%08" PRIx32 " status=%d\n", ap, idr, st);
+    if (st != PROBE_OK || !idr || idr == UINT32_MAX) return 1;
+    if (argc == 2) return 0;
+    unsigned long addr = strtoul(argv[2], &end, 0);
+    if (*end || addr > UINT32_MAX - 31u || (addr & 3u)) return 1;
+    uint32_t saved[8], pattern[8], actual[8];
+    st = probe_mem_select_ap((uint32_t)ap, 0);
+    if (st == PROBE_OK) st = probe_mem_read_block32((uint32_t)addr, saved, 8);
+    if (st != PROBE_OK) { printf("Scratch backup failed, no writes performed\n"); return 1; }
+    for (unsigned i = 0; i < 8; ++i) pattern[i] = 0xa5a50000u ^ (0x10204081u * i);
+    st = probe_mem_write_block32((uint32_t)addr, pattern, 8);
+    if (st == PROBE_OK) st = probe_mem_read_block32((uint32_t)addr, actual, 8);
+    bool passed = st == PROBE_OK && !memcmp(pattern, actual, sizeof(pattern));
+    probe_status_t restored = probe_mem_write_block32((uint32_t)addr, saved, 8);
+    if (restored == PROBE_OK) restored = probe_mem_read_block32((uint32_t)addr, actual, 8);
+    bool restore_ok = restored == PROBE_OK && !memcmp(saved, actual, sizeof(saved));
+    printf("RAM loopback=%s restore=%s\n", passed ? "PASS" : "FAIL", restore_ok ? "PASS" : "FAIL");
+    return passed && restore_ok ? 0 : 1;
+}
+
 /* 会直接碰 SWD 总线的命令统一加锁，避免和 dap_worker 撞车 */
 #define LOCKED_WRAP(name, fn)                                             \
     static int name(int argc, char **argv)                                \
@@ -671,6 +722,15 @@ static int cmd_reboot(int argc, char **argv)
         return r;                                                        \
     }
 
+LOCKED_WRAP(cmd_selftest_l, cmd_selftest)
+LOCKED_WRAP(cmd_swdtr_l, cmd_swdtr)
+LOCKED_WRAP(cmd_swdidle_l, cmd_swdidle)
+LOCKED_WRAP(cmd_swdclkidle_l, cmd_swdclkidle)
+LOCKED_WRAP(cmd_swdemu_l, cmd_swdemu)
+LOCKED_WRAP(cmd_datachk_l, cmd_datachk)
+LOCKED_WRAP(cmd_trace_l, cmd_trace)
+LOCKED_WRAP(cmd_rstlow_l, cmd_rstlow)
+LOCKED_WRAP(cmd_rsthi_l, cmd_rsthi)
 LOCKED_WRAP(cmd_swd_l, cmd_swd)
 LOCKED_WRAP(cmd_swdtiming_l, cmd_swdtiming)
 LOCKED_WRAP(cmd_swdfast_l, cmd_swdfast)
@@ -684,8 +744,9 @@ LOCKED_WRAP(cmd_reset_l, cmd_reset)
 
 static const esp_console_cmd_t s_cmds[] = {
     {.command = "wificfg", .help = "WiFi setup protocol: id status|scan|page|save|clear", .func = cmd_wificfg},
+    {.command = "selftest", .help = "selftest <APSEL> [scratch RAM] AP IDR and optional RAM loopback", .func = cmd_selftest_l},
     {.command = "status", .help = "显示 USB/WiFi/BLE/SWD 状态", .func = cmd_status},
-    {.command = "ota", .help = "ota status|arm [seconds]|off ESP32 USB/WiFi/BLE 自身固件升级", .func = cmd_ota},
+    {.command = "ota", .help = "ota status|arm [seconds] [usb|wifi|ble|all]|off ESP32 USB/WiFi/BLE 自身固件升级", .func = cmd_ota},
     {.command = "wifi", .help = "wifi <ssid> <pass> 设置 | wifi -c 清除 | wifi 查看", .func = cmd_wifi},
     {.command = "wifihex", .help = "wifihex <SSID十六进制> [密码]（支持中文 SSID）", .func = cmd_wifihex},
     {.command = "swd", .help = "swd [kHz] 设置 SWD 时钟", .func = cmd_swd_l},
@@ -696,16 +757,16 @@ static const esp_console_cmd_t s_cmds[] = {
     {.command = "pins", .help = "SWD 引脚电气诊断", .func = cmd_pins_l},
     {.command = "iochk", .help = "验证 SWDIO 释放(tri-state)与 SWCLK 输出", .func = cmd_iochk_l},
     {.command = "nrsttest", .help = "测 NRST 线是否真的接到目标", .func = cmd_nrsttest_l},
-    {.command = "swdtr", .help = "swdtr <0|1> 请求后额外 turnaround 时钟数", .func = cmd_swdtr},
-    {.command = "swdidle", .help = "swdidle <n> 传输末尾 idle 时钟数", .func = cmd_swdidle},
-    {.command = "swdclkidle", .help = "swdclkidle <0|1> SWCLK 空闲电平", .func = cmd_swdclkidle},
-    {.command = "swdemu", .help = "swdemu on|off|dump 内置 SWD 目标仿真器（自检）", .func = cmd_swdemu},
-    {.command = "datachk", .help = "datachk [hex] 用 CLK 中断回采 SWDIO 输出，验证波形", .func = cmd_datachk},
-    {.command = "trace", .help = "trace 录一次 probe_connect 的完整位流", .func = cmd_trace},
+    {.command = "swdtr", .help = "swdtr <0|1> 请求后额外 turnaround 时钟数", .func = cmd_swdtr_l},
+    {.command = "swdidle", .help = "swdidle <n> 传输末尾 idle 时钟数", .func = cmd_swdidle_l},
+    {.command = "swdclkidle", .help = "swdclkidle <0|1> SWCLK 空闲电平", .func = cmd_swdclkidle_l},
+    {.command = "swdemu", .help = "swdemu on|off|dump 内置 SWD 目标仿真器（自检）", .func = cmd_swdemu_l},
+    {.command = "datachk", .help = "datachk [hex] 用 CLK 中断回采 SWDIO 输出，验证波形", .func = cmd_datachk_l},
+    {.command = "trace", .help = "trace 录一次 probe_connect 的完整位流", .func = cmd_trace_l},
     {.command = "rst", .help = "复位目标", .func = cmd_reset_l},
     {.command = "swdreset", .help = "复位期间连接（connect under reset）", .func = cmd_swdreset_l},
-    {.command = "rstlow", .help = "拉低 NRST 并保持", .func = cmd_rstlow},
-    {.command = "rsthi", .help = "释放 NRST", .func = cmd_rsthi},
+    {.command = "rstlow", .help = "拉低 NRST 并保持", .func = cmd_rstlow_l},
+    {.command = "rsthi", .help = "释放 NRST", .func = cmd_rsthi_l},
     {.command = "baud", .help = "baud [n] 设置目标串口波特率", .func = cmd_baud},
     {.command = "reboot", .help = "重启设备", .func = cmd_reboot},
 };

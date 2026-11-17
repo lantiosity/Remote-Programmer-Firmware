@@ -32,6 +32,8 @@ static char s_serial[24];
 static char s_ssid[33];
 static char s_pass[65];
 static int  s_baud = CONFIG_TARGET_UART_BAUD;
+static esp_timer_handle_t s_reboot_timer;
+static void reboot_timer_cb(void *arg);
 
 static nvs_handle_t open_nvs(void)
 {
@@ -55,6 +57,11 @@ static void load_str(nvs_handle_t h, const char *key, char *dst, size_t dst_len)
 
 esp_err_t cfg_init(void)
 {
+    if (!s_reboot_timer) {
+        const esp_timer_create_args_t timer_args = {.callback=reboot_timer_cb, .name="reboot"};
+        esp_err_t err = esp_timer_create(&timer_args, &s_reboot_timer);
+        if (err != ESP_OK) return err;
+    }
     uint8_t mac[6] = {0};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_serial, sizeof(s_serial), "ESP-SWD-%02X%02X%02X", mac[3], mac[4], mac[5]);
@@ -202,12 +209,7 @@ static void reboot_timer_cb(void *arg)
 
 void cfg_reboot_later(uint32_t delay_ms)
 {
-    esp_timer_handle_t timer = NULL;
-    const esp_timer_create_args_t args = {
-        .callback = reboot_timer_cb,
-        .name = "reboot",
-    };
-    if (esp_timer_create(&args, &timer) == ESP_OK) {
-        esp_timer_start_once(timer, (uint64_t)delay_ms * 1000u);
-    }
+    /* Created once during startup. First pending request wins; start_once is
+     * thread-safe and returns INVALID_STATE when already scheduled. */
+    if (s_reboot_timer) (void)esp_timer_start_once(s_reboot_timer, (uint64_t)delay_ms * 1000u);
 }

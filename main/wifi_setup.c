@@ -20,6 +20,8 @@ static QueueHandle_t s_jobs;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_busy;
 static char s_reply[REPLY_SIZE] = "{\"id\":\"\",\"ok\":false,\"error\":\"no_request\"}";
+/* Scan cache/reply production belong to the single worker. BLE RX assembly
+ * belongs only to NimBLE host callbacks; USB assembles its own request. */
 static wifi_ap_record_t s_networks[20];
 static uint16_t s_count;
 static char s_rx[REQUEST_SIZE];
@@ -65,6 +67,7 @@ static void fail(cJSON *root, const char *error)
 }
 static void worker(void *unused)
 {
+    (void)unused;
     job_t job;
     while (xQueueReceive(s_jobs, &job, portMAX_DELAY) == pdTRUE) {
         char *save = NULL;
@@ -112,7 +115,7 @@ static void worker(void *unused)
                 cJSON_AddNumberToObject(root, "pages", (s_count + 2) / 3);
             }
         } else if (!strcmp(op, "save") || !strcmp(op, "clear")) {
-            if (!job.usb && !(status[3] & 1)) fail(root, "window_closed");
+            if (!job.usb && !ble_ota_window_for(OTA_ALLOW_BLE)) fail(root, "window_closed");
             else if (ble_ota_in_progress()) fail(root, "device_busy");
             else {
                 esp_err_t err = ESP_ERR_INVALID_ARG;
@@ -141,13 +144,18 @@ static void worker(void *unused)
 }
 esp_err_t wifi_setup_init(void)
 {
+    if (s_jobs) return ESP_OK;
     s_jobs = xQueueCreate(1, sizeof(job_t));
     if (!s_jobs) return ESP_ERR_NO_MEM;
-    return xTaskCreate(worker, "wifi_setup", 6144, NULL, 4, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+    if (xTaskCreate(worker, "wifi_setup", 6144, NULL, 4, NULL) == pdPASS) return ESP_OK;
+    vQueueDelete(s_jobs);
+    s_jobs = NULL;
+    return ESP_ERR_NO_MEM;
 }
 esp_err_t wifi_setup_submit(const char *request, bool usb)
 {
-    size_t length = strlen(request);
+    if (!request) return ESP_ERR_INVALID_ARG;
+    size_t length = strnlen(request, REQUEST_SIZE);
     if (!s_jobs || length < 10 || length >= REQUEST_SIZE || request[8] != ' ') return ESP_ERR_INVALID_ARG;
     for (unsigned i = 0; i < 8; ++i) if (!((request[i] >= '0' && request[i] <= '9') || (request[i] >= 'a' && request[i] <= 'f'))) return ESP_ERR_INVALID_ARG;
     portENTER_CRITICAL(&s_lock);
@@ -156,15 +164,21 @@ esp_err_t wifi_setup_submit(const char *request, bool usb)
     snprintf(s_reply, sizeof(s_reply), "{\"id\":\"%.8s\",\"busy\":true}", request);
     portEXIT_CRITICAL(&s_lock);
     job_t job = {.usb = usb}; memcpy(job.text, request, length + 1);
-    if (xQueueSend(s_jobs, &job, 0) != pdTRUE) { s_busy = false; return ESP_FAIL; }
+    if (xQueueSend(s_jobs, &job, 0) != pdTRUE) {
+        portENTER_CRITICAL(&s_lock);
+        s_busy = false;
+        portEXIT_CRITICAL(&s_lock);
+        return ESP_ERR_TIMEOUT;
+    }
     return ESP_OK;
 }
 size_t wifi_setup_response(char *out, size_t capacity)
 {
+    if (!out || !capacity) return 0;
     portENTER_CRITICAL(&s_lock);
     size_t length = strlcpy(out, s_reply, capacity);
     portEXIT_CRITICAL(&s_lock);
-    return length;
+    return length < capacity ? length : capacity - 1;
 }
 #define WIFI_UUID(n) BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,0x93,0xf3,0xa3,0xb5,n,0x00,0x40,0x6e)
 static const ble_uuid128_t svc_uuid = WIFI_UUID(0x30), request_uuid = WIFI_UUID(0x31), reply_uuid = WIFI_UUID(0x32);

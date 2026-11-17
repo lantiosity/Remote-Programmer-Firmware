@@ -48,7 +48,7 @@ void app_main(void)
 
     ESP_LOGI(TAG, "ESP32-S3 多链路 DAPLink 启动");
 
-    cfg_init();
+    ESP_ERROR_CHECK(cfg_init());
     ESP_ERROR_CHECK(wifi_setup_init());
 
     const cfg_probe_pins_t *pins = cfg_probe();
@@ -64,7 +64,7 @@ void app_main(void)
         ESP_LOGE(TAG, "SWD 初始化失败: %s", esp_err_to_name(err));
     }
 
-    link_init();
+    ESP_ERROR_CHECK(link_init());
 
     err = usb_dev_init();
     if (err != ESP_OK) {
