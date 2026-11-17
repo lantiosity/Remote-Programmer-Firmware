@@ -58,6 +58,13 @@ subprocess.run([GCC, '-shared', '-fPIC', *(['-Wl,--export-all-symbols'] if os.na
                 '-I'+str(ROOT/'tests/native/include'),'-I'+str(ROOT/'main/include'),
                 str(ROOT/'main/probe_core.c'),str(BUILD/'swd_backend.c'),'-o',str(core_library)], check=True)
 core = ctypes.CDLL(str(core_library))
+serial_library = BUILD / ('serial.dll' if os.name == 'nt' else 'serial.so')
+subprocess.run([GCC, '-shared', '-fPIC', *(['-Wl,--export-all-symbols'] if os.name == 'nt' else []),
+                '-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-parameter',
+                '-I'+str(ROOT/'tests/native/include'),'-I'+str(ROOT/'main/include'),
+                str(ROOT/'main/serial_bridge.c'),str(ROOT/'tests/native/serial_backend.c'),
+                '-o',str(serial_library)], check=True)
+serial = ctypes.CDLL(str(serial_library))
 
 
 def counter(name):
@@ -194,6 +201,25 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(core.probe_mem_read_block8(0,data,4096),0)
         self.assertEqual(bytes(data),bytes(self.memory[:4096]))
         self.assertLess(ctypes.c_uint.in_dll(core,'model_transfers').value,1200)
+
+
+class SerialTests(unittest.TestCase):
+    def test_duplicate_subscribe_unsubscribe_and_full_table(self):
+        self.assertNotEqual(serial.test_subscribe(1),0)  # init owns mutex creation
+        self.assertEqual(serial.serial_bridge_init(),0)
+        for _ in range(100):
+            self.assertEqual(serial.test_subscribe(1),0)
+            self.assertEqual(serial.test_subscribe(1),0)
+            serial.test_unsubscribe(1)
+            serial.test_unsubscribe(1)
+            self.assertEqual(ctypes.c_uint.in_dll(serial,'mock_locks_held').value,0)
+        for token in range(4): self.assertEqual(serial.test_subscribe(token),0)
+        self.assertNotEqual(serial.test_subscribe(4),0)
+        serial.test_unsubscribe(2)
+        self.assertEqual(serial.test_subscribe(4),0)
+        for token in range(5): serial.test_unsubscribe(token)
+        self.assertEqual(ctypes.c_uint.in_dll(serial,'mock_locks_held').value,0)
+        self.assertEqual(ctypes.c_uint.in_dll(serial,'mock_lock_errors').value,0)
 
 
 if __name__ == '__main__':
