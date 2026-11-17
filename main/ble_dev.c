@@ -58,6 +58,7 @@ static uint16_t s_nus_tx_handle;
 static uint16_t s_conn = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t  s_own_addr_type;
 static atomic_bool s_ready;
+static atomic_bool s_dap_notify, s_nus_notify;
 
 static uint8_t s_rx[DAP_JSON_BUF];
 static size_t  s_rx_len;
@@ -103,6 +104,12 @@ static void ble_tx_worker(struct ble_npl_event *ev)
         s_active = NULL;
         if (xQueueReceive(s_tx_queue, &s_active, 0) != pdTRUE) return;
     }
+    if (s_active->handle == s_nus_tx_handle && !atomic_load(&s_nus_notify)) {
+        free(s_active);
+        s_active = NULL;
+        (void)ble_npl_callout_reset(&s_tx_retry, ble_npl_time_ms_to_ticks32(1));
+        return;
+    }
     uint16_t conn = (uint16_t)token;
     uint16_t mtu = ble_att_mtu(conn);
     size_t chunk = mtu > 3 ? mtu - 3 : 20;
@@ -130,6 +137,7 @@ static bool notify_enqueue(int token, uint16_t handle, const uint8_t *data, size
 {
     if (!s_ready || token < 0 || token != atomic_load(&s_token) || !handle ||
         !data || !len || len > DAP_JSON_BUF || !s_tx_queue) return false;
+    if (!(dap ? atomic_load(&s_dap_notify) : atomic_load(&s_nus_notify))) return false;
     notify_packet_t *packet = malloc(sizeof(*packet) + len + (dap ? 1 : 0));
     if (!packet) {
         link_note_drop();
@@ -302,6 +310,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
                 return 0;
             }
             s_conn = event->connect.conn_handle;
+            s_dap_notify = false;
+            s_nus_notify = false;
             int token = (int)s_conn | (int)((++s_epoch & 0x7fffu) << 16);
             atomic_store(&s_token, token);
             link_session_set(LINK_SINK_BLE, token);
@@ -321,6 +331,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
         if (event->disconnect.conn.conn_handle != s_conn) return 0;
         serial_bridge_unsubscribe(ble_serial_sink, atomic_load(&s_token));
         atomic_store(&s_token, -1);
+        s_dap_notify = false;
+        s_nus_notify = false;
         link_session_set(LINK_SINK_BLE, -1);
         ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
         s_conn = BLE_HS_CONN_HANDLE_NONE;
@@ -334,6 +346,13 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "BLE MTU = %d", event->mtu.value);
+        return 0;
+
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        if (event->subscribe.conn_handle == s_conn) {
+            if (event->subscribe.attr_handle == s_dap_tx_handle) s_dap_notify = event->subscribe.cur_notify;
+            if (event->subscribe.attr_handle == s_nus_tx_handle) s_nus_notify = event->subscribe.cur_notify;
+        }
         return 0;
 
     default:
