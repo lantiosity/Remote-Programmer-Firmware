@@ -1,0 +1,66 @@
+# ESP32-S3 固件 @VERSION@ 烧录说明
+
+适用 ESP32-S3 N16R8（16 MiB Flash、8 MiB Octal PSRAM）。镜像由 ESP-IDF v6.1 构建，应用项目名 `esp_swdlink`，版本 `@VERSION@`。本包用于烧录 ESP32 自身。
+
+## 原生 USB 完整安装
+
+无需安装 ESP-IDF 或编译源码；需要 Python 和 esptool。本包验证使用 esptool 5.6.0：
+
+```powershell
+python -m pip install esptool==5.6.0
+```
+
+1. 解压整个烧录包，保持所有文件相对路径不变。在包含 `flash_args` 的目录打开 PowerShell。
+2. 连接 ESP32-S3 原生 USB/OTG 数据口。按住 BOOT，按一下 RESET，再松开 BOOT；在设备管理器查看 ROM 下载口（USB Serial Device / USB JTAG/serial debug unit）。原生 USB 可烧录整套镜像，无需另外连接 UART 口。
+3. 关闭占用该端口的终端/工具，把下列 `COM22` 改为实际下载端口后执行：
+
+```powershell
+python -m esptool --chip esp32s3 --port COM22 --before no-reset --after hard-reset write-flash "@flash_args"
+```
+
+4. 等待 esptool 完成各段写入及校验。松开 BOOT，如仍停留在 ROM 下载状态，只按一下 RESET。应用应枚举 CMSIS-DAP HID 和 CDC 串口；运行时 CDC 与 ROM 下载口的编号可能不同。等待约 5 秒完成应用初始化。
+
+USB-UART/CH343 也支持本命令：按相同步骤手动进入下载模式，改用其 COM 口。连接失败时先核对数据线、BOOT/RESET 操作和实际 COM 口；不要使用正在运行应用的 CDC 口代替 ROM 下载口。
+
+## 烧录文件与地址
+
+`flash_args` 已固定为 ESP32-S3、DIO、80 MHz、16 MB 的构建烧录参数。ESP32-S3 Flash Download Tool 也可按下表分别加载四个 BIN，使用相同参数，关闭全片擦除。
+
+| 文件 | 地址 | 说明 |
+| --- | --- | --- |
+| `bootloader/bootloader.bin` | `0x0` | 引导程序 |
+| `partition_table/partition-table.bin` | `0x8000` | 分区表 |
+| `esp_swdlink.bin` | `0x10000` | factory 应用 |
+| `ota_data_initial.bin` | `0x310000` | 初始化 OTA 选择 |
+
+完整安装会覆盖 factory、分区表、bootloader 和 OTA 选择数据，从 factory 启动。命令分别写入以上区域，不执行全片擦除；NVS（含 WiFi 配置）、PHY 与 offline 预留区保留。已有设备请先备份重要数据，尤其在迁移旧分区布局前。不要把应用 BIN 单独写到 `0x0`。
+
+## 分区及日常 OTA
+
+| 分区 | 起始地址 | 大小 |
+| --- | --- | --- |
+| nvs | `0x9000` | 24 KiB |
+| phy_init | `0xf000` | 4 KiB |
+| factory | `0x10000` | 3 MiB |
+| otadata | `0x310000` | 8 KiB |
+| ota_0 | `0x320000` | 4 MiB |
+| ota_1 | `0x720000` | 4 MiB |
+| offline | `0xb20000` | 4.875 MiB |
+
+`partitions.csv` 同步附带供核对；offline 为原始存储预留区，当前没有离线烧录功能。首次安装或分区改变使用完整烧录，应用 OTA 不会迁移分区表。
+
+日常 USB/WiFi/BLE OTA 只选择本目录的 **`esp_swdlink.bin`**。设备正常运行时长按 BOOT 约 2 秒开启升级窗口（不要同时复位），或 UART 控制台 `ota arm 300 wifi` / `ota arm 300 ble` 授权对应无线链路。USB 发起的授权仅允许 USB OTA，BLE OTA 默认要求加密连接，首次需通过操作系统配对。使用配套上位机的 ESP32 固件升级功能传输并激活。WiFi 默认热点 `ESP-SWD`、密码 请在 menuconfig 设置独立口令，热点地址 `192.168.4.1`，OTA 服务 TCP 5557。USB OTA 使用应用 HID 扩展，与上述 ROM 串口完整烧录不同。传输完成并校验后才切换 OTA 槽；应用启动后约 5 秒确认健康，未确认即复位时由 bootloader 回退。
+
+## 接线与校验
+
+SWCLK=GPIO4、SWDIO=GPIO5、nRESET=GPIO6，目标 UART TX=GPIO17、RX=GPIO18；烧录目标 MCU 时需目标独立供电并共地，按目标电平接线。
+
+`manifest.json` 记录构建来源、镜像版本、分区与各文件 SHA256，`SHA256SUMS.txt` 可核对包内文件。例如：
+
+```powershell
+Get-FileHash .\esp_swdlink.bin -Algorithm SHA256
+```
+
+本包已完成当前源码构建检查、ESP 镜像校验和/内部 SHA256 检查、分区检查及打包文件哈希核对。本次打包没有执行物理设备烧录；历史其他版本的硬件测试不作为本版硬件验收结果。
+
+接收空闲超时默认 120 秒，校验完成后等待激活默认 600 秒。BLE Just Works 加密不等于 MITM 身份认证；当前镜像没有签名认证，物理授权窗口期间应只允许可信客户端接近设备。SPI2 实际频率、BLE 压力与 OTA 回滚仍需实板验收。
