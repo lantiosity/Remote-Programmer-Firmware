@@ -1,7 +1,7 @@
 # 固件版本归档
 
-首版：[`0.1.0/`](0.1.0/)。包含原始源码 ZIP，以及可直接烧录的 [`images/`](0.1.0/images/) 和 `firmware-0.1.0-flash.zip`。烧录方法见 [固件 README](../README.md#直接烧录发布固件无需编译) 和 [镜像说明](0.1.0/images/README.md)。不放构建环境或缓存。
+当前修复版：**[0.1.1/](0.1.1/)**；历史首版：[0.1.0/](0.1.0/)，保留原归档。
 
-在项目根目录完成版本修改、构建验证并暂存源码后，执行 `python tools/archive-source.py 版本号`，再将该版本目录加入提交。脚本不会覆盖已存在的版本目录。归档不包含 `release/` 自身，避免嵌套历史包。
+各版均包含源码 ZIP、逐文件清单、SHA256，以及可直接烧录的 `images/` 和 `firmware-版本-flash.zip`。烧录步骤见 [固件 README](../README.md#直接烧录发布固件无需编译)。不包含工具链或依赖缓存。
 
-上述脚本仅归档源码；可烧录包还需从同版本成功构建的 `build/flasher_args.json` 取齐 bootloader、分区表、应用和初始 otadata，保留相对路径及 `flash_args`，并核对镜像版本、分区布局及 SHA256。发布前同时更新烧录包及其独立清单；应用镜像可供 OTA 使用。
+发布流程：更新 `CMakeLists.txt`、CHANGELOG、修复记录与 README；原生回归和 ESP-IDF 构建通过后暂存源码，执行 `python tools/archive-source.py 版本号`。再执行 `python tools/package-images.py 版本号` 从同版构建生成镜像与烧录 ZIP，校验文件版本、分区及 SHA256。两个脚本不覆盖已有归档。最后单独提交 release，并创建版本标签；未执行硬件验收时必须记录为待验收。

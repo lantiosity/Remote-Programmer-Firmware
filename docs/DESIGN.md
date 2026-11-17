@@ -126,7 +126,7 @@ has_swo（返回 false）, swo_*（返回错误）, jtag_sequence（返回错误
 `supported_wire_protocols`、`wire_protocol`、`capabilities`。
 
 参数大小：TCP 一次最多收 20KB 的 JSON 行（够 `write_block32` 写 1KB 页），
-`read_block32` 单次最多 2048 字（8KB）。
+`read_block32` / `read_ap_multiple` 响应最多 1856 字；`read_block8` 最多 5104 字节。响应头预算 64 字节，uint32/byte 十进制元素最坏分别为 11/4 字符（含逗号）。`write_block32` / `write_ap_multiple` 数组最多 2048 字，`write_block8` 最多 5104 字节且整条 JSON 必须小于 20480 字节；4096 字节页写已回归。非法或过长数组整体报错，不会部分写入。
 
 ## 6. 蓝牙 GATT
 
@@ -173,8 +173,8 @@ UART1 (GPIO17/18)
 - **AP posted read**：AP 读到的总是上一次的数据，所以
   `probe_ap_read()` 会再读一次 DP `RDBUFF`；`probe_transfer_block()` 对 AP 块读
   做了"读 count 次 + 末尾 RDBUFF"的移位修正。
-- **MEM-AP**：`CSW = size | 0x10(SingleAddrInc) | 0x40(DeviceEn)`，
-  8/16 位访问按地址对齐移位（与 pyOCD 的 `ap.py` 行为一致）；块访问靠 TAR 自增。
+- **MEM-AP**：保留现有 CSW 高位 HPROT/HNONSEC，仅更新 size/SingleAddrInc/DeviceEn，
+  8/16 位访问按地址对齐移位（与 pyOCD 的 `ap.py` 行为一致）；块访问靠 TAR 自增，并在每个 1 KiB 边界重新设置 TAR；字节块用对齐 32 位批量传输，仅首尾采用 8 位访问。
 - **WAIT 重试**：`DAP_TransferConfigure` 设置的 `wait_retry` 次。
 
 ## 9. 任务与内存
@@ -215,10 +215,10 @@ ESP-SWD DAPLink 配置
 - `DAP_Transfer` 在 ACK 失败时仍追加 4 字节数据 → 上位机解析错位。
 - 响应缓冲溢出时返回半截 JSON → 现在返回 `status=1` 且数据量上限由缓冲反推。
 - SWD 总线加递归互斥锁（`probe_lock/unlock`），控制台诊断命令与 `dap_worker` 不再打架。
-- GPIO 编号做 `SOC_GPIO_PIN_COUNT` 范围检查。
+- SWCLK/SWDIO 限制 GPIO0～31、验证输出能力与引脚互斥，避免低位寄存器掩码越界。
 - `probe_connect` 仅在 ACK 成功时标记 connected。
 
-- **BLE 通知跨任务**：改为投递 npl 事件到 NimBLE host 默认事件队列，真正发送在 host 任务里做；分片发送在 `BLE_HS_ENOMEM` 时按 1ms 退避重试（背压），仍失败则丢弃剩余并打日志。
+- **BLE 通知跨任务**：改为投递 npl 事件到 NimBLE host 默认事件队列，真正发送在 host 任务里做；每个响应独立拥有不可变缓冲，8 槽队列；每次事件只发一片，`BLE_HS_ENOMEM` 由 callout 退避，host 不睡眠。DAP 队列持续拥塞或发送失败时断开连接，避免继续输出残缺 JSON。BLE 限定单连接，连接代号隔离旧通知。
 - **CDC 并发**：`usb_dev_cdc_read/write` 改用 esp_tinyusb 的 `tinyusb_cdcacm_read/write_queue/write_flush`（内部有临界区）。
 - **TCP 会话**：`link_submit` 的 opaque 改成 `fd | (epoch<<16)`，`tcp_dap_send` 同时校验 fd 和会话代号，fd 复用不会写错连接。
 - **串口订阅表**：`s_sinks` 加互斥锁，取快照后在锁外调用回调；客户端 fd 设 `SO_SNDTIMEO=1s`，对端不读不会卡死 UART 转发。
@@ -226,6 +226,14 @@ ESP-SWD DAPLink 配置
 
 待办：
 
-- `wirelink` 增加 `selftest`（`read_ap((1<<24)|0xFC)`、内存回环），把 AP 银行类 bug 钉在回归测试里。
+- 固件控制台已实现 `selftest <APSEL> [scratch RAM]`，默认只读 AP IDR；显式提供地址后备份、写读、恢复 32 字节。协议/APSEL/内存边界由 `tests/run_native.py` 回归。
 - `probe_swd_output_sequence` 的无效参数清理、`DAP_SWD_Sequence(0x1D)` 支持。
 - 目标板 SWD 应答问题（物理层）尚未闭环。
+
+## 0.1.1 会话与发送上下文
+
+`link_session_set` 只更新链路的连接代号；CPU1 的 DAP worker 每次取请求及空闲轮询时同步生命周期。TCP/BLE handle 表分离，断开重连后回收；旧代号请求丢弃。若该链路最后使用了 SWD，worker 在总线锁内断开 probe；网络或 NimBLE 回调不直接操作 dedicated GPIO。
+
+所有响应发送均在释放总线锁后进行。HID 响应通过队列和 `usbd_defer_func` 在 TinyUSB 上下文发送，由发送完成回调续发；USB 重枚举代号隔离旧响应。TCP DAP/串口发送与关闭由各自 mutex 串行，发送前同时校验 fd 和 epoch，避免 close/send TOCTOU。
+
+`swd_emu` 固定使用 GPIO7/8，ACK 是简化模型，仅用于诊断自检，不代表真实目标时序；不能作为高速 SPI2 或目标芯片兼容性验收。SPI2 LL 实现锁定 ESP-IDF 6.1，失效回退 GPIO 时输出日志，重新初始化引脚会关闭 SPI 选择，需显式重新 `swdspi on`。

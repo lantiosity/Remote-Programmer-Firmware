@@ -1,17 +1,17 @@
-# ESP32-S3 远程烧录器固件 0.1.0
+# ESP32-S3 远程烧录器固件 0.1.1
 
-独立固件源码仓库，首版编号为 **0.1.0**。支持 CMSIS-DAP、SWD、USB/WiFi/BLE 链路、目标 UART 桥、ESP32 自身 OTA 和 USB/BLE WiFi 配置。配套 WebView2 上位机首版为 0.2.0，在另一个仓库维护。
+独立固件源码仓库，当前修复版 **0.1.1**，首版为 0.1.0。支持 CMSIS-DAP、SWD、USB/WiFi/BLE 链路、目标 UART 桥、ESP32 自身 OTA 和 USB/BLE WiFi 配置。配套 WebView2 上位机首版为 0.2.0，在另一个仓库维护。
 
 ## 直接烧录发布固件（无需编译）
 
-可烧录文件位于 [`release/0.1.0/images/`](release/0.1.0/images/)，也可解压同版本目录的 `firmware-0.1.0-flash.zip` 单独使用。适用于 **ESP32-S3 N16R8：16 MiB Flash、8 MiB Octal PSRAM**；这组镜像烧录到 ESP32，不是 STM32 目标板。
+可烧录文件位于 [`release/0.1.1/images/`](release/0.1.1/images/)，也可解压同版本目录的 `firmware-0.1.1-flash.zip` 单独使用。适用于 **ESP32-S3 N16R8：16 MiB Flash、8 MiB Octal PSRAM**；这组镜像烧录到 ESP32，不是 STM32 目标板。
 
 1. 安装 Python 和 esptool：`python -m pip install esptool==5.6.0`。已激活 ESP-IDF 环境的用户可使用其自带 esptool。
 2. 用数据线连接 ESP32-S3 的原生 USB/OTG 口，按住 BOOT，按一下 RESET，再松开 BOOT；在设备管理器查看新出现的 ROM 下载串口。原生 USB 可以完成整套烧录，无需另接 USB 转串口。
 3. 在固件仓库目录打开 PowerShell，执行以下命令，把 `COM22` 换成实际下载端口：
 
 ```powershell
-cd release/0.1.0/images
+cd release/0.1.1/images
 python -m esptool --chip esp32s3 --port COM22 --before no-reset --after hard-reset write-flash "@flash_args"
 ```
 
@@ -26,7 +26,7 @@ python -m esptool --chip esp32s3 --port COM22 --before no-reset --after hard-res
 
 完整安装会覆盖 factory 和 OTA 选择数据，重新从 factory 启动；命令按地址分别写入，不擦除 NVS、PHY 和 offline 预留区。已有设备应先备份重要数据，且不要启用全片擦除。factory 为 3 MiB，两个 OTA 槽各 4 MiB，offline 保留 4.875 MiB，后者尚未实现离线烧录功能。分区变化必须走完整安装，不能只传应用 OTA。
 
-日常 USB/WiFi/BLE OTA 只选择 `release/0.1.0/images/esp_swdlink.bin`，不要选择 bootloader、分区表、ZIP 或源码包；参见 [OTA 操作说明](docs/OTA.md)。镜像清单及 SHA256、详细烧录说明见 [发布包 README](release/0.1.0/images/README.md)。
+日常 USB/WiFi/BLE OTA 只选择 `release/0.1.1/images/esp_swdlink.bin`，不要选择 bootloader、分区表、ZIP 或源码包；参见 [OTA 操作说明](docs/OTA.md)。镜像清单及 SHA256、详细烧录说明见 [发布包 README](release/0.1.1/images/README.md)。
 
 ## 构建
 
@@ -49,4 +49,18 @@ WiFi 凭据通过运行时配网保存到设备 NVS，不提交到源码。默�
 
 `main/` 为固件实现，`partitions.csv` 是 16 MiB 分区布局。USB/WiFi/BLE 配网共用 `wifi_setup.c`；设备信息中的 `wifi_setup: 1` 用于能力识别，避免版本重新从 0.1.0 编号导致旧的大小比较误判。
 
-`release/0.1.0/` 保存首版源码快照，以及另行打包的可烧录镜像、文件清单和 SHA256。源码 ZIP 保持原样，预编译镜像在 `images/` 和 `firmware-0.1.0-flash.zip`；发布包不含工具链或依赖缓存。后续新增版本目录，不覆盖历史归档。本次打包未重刷物理设备。
+`release/0.1.0/` 保留首版归档，`release/0.1.1/` 保存本次修复版源码及可烧录镜像、清单和 SHA256。各版独立归档，不覆盖旧包；发布包不含工具链或依赖缓存。本次未重刷物理设备。
+
+## 0.1.1 修复与验证
+
+修复计划及逐项结果见 [审阅修复记录](docs/REVIEW_FIX_PLAN.md)，版本变化见 [CHANGELOG](CHANGELOG.md)。本版重点修复 BLE 数据覆盖、4 KiB 块写截断、会话/串口并发、APSEL 与 SWJ 精度，以及 GPIO/SPI 状态和 OTA 授权。
+
+USB 发起的 OTA 授权只开放 USB；WiFi/BLE 升级请长按 BOOT 约 2 秒，或在 UART 控制台使用 `ota arm 300 wifi` / `ota arm 300 ble`。BLE OTA 默认要求加密连接，首次请在操作系统完成配对；详见 [OTA](docs/OTA.md)。
+
+原生回归（需要 gcc 与已解析的 cJSON 组件，无需目标板）：
+
+```powershell
+python tests/run_native.py
+```
+
+`selftest <APSEL>` 读取 AP IDR；`selftest <APSEL> <scratch_RAM_address>` 在用户指定、已暂停目标的 32 字节空闲 RAM 上执行备份、写读与恢复。不要向该命令提供外设或 Flash 地址。真实板卡的 BLE 压力、USB/WiFi 下载/OTA 和 SPI2 波形仍需硬件验收，未使用旧版本结果代替本版验收。
