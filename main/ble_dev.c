@@ -239,18 +239,19 @@ static int gatt_access(uint16_t conn_handle, uint16_t attr_handle,
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
         if (ble_ota_in_progress()) return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
-        uint16_t total = OS_MBUF_PKTLEN(ctxt->om);
-        uint8_t tmp[512];
-        if (total > sizeof(tmp)) {
+        serial_input_chunk_t chunk = {.len = OS_MBUF_PKTLEN(ctxt->om)};
+        if (chunk.len > sizeof(chunk.data) || (kind == CH_NUS_RX && !chunk.len)) {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
-        if (os_mbuf_copydata(ctxt->om, 0, total, tmp) != 0) {
+        if (os_mbuf_copydata(ctxt->om, 0, chunk.len, chunk.data) != 0) {
             return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
         }
         if (kind == CH_DAP_RX) {
-            dap_input(tmp, total);
+            dap_input(chunk.data, chunk.len);
         } else if (kind == CH_NUS_RX) {
-            serial_bridge_to_target(tmp, total);
+            esp_err_t err = serial_bridge_to_target(&chunk, 0);
+            if (err == ESP_ERR_TIMEOUT) return BLE_ATT_ERR_INSUFFICIENT_RES;
+            if (err != ESP_OK) return BLE_ATT_ERR_UNLIKELY;
         }
         return 0;
     }

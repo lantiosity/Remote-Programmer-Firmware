@@ -9,7 +9,9 @@ static uint8_t stored[128], staging[128];
 static size_t stored_length, staged_length;
 bool mock_ota_active, mock_reboot_reserved, mock_timer_scheduled;
 bool mock_reserved_during_write, mock_reserved_during_timer;
+bool mock_erase_without_reservation;
 unsigned mock_writes, mock_commits;
+unsigned mock_legacy_keys, mock_erase_calls, mock_erase_error_on, mock_commit_error_on;
 int mock_write_error, mock_commit_error, mock_timer_error;
 
 void test_cfg_reset(void)
@@ -17,7 +19,10 @@ void test_cfg_reset(void)
     stored_length = staged_length = 0;
     mock_ota_active = mock_reboot_reserved = mock_timer_scheduled = false;
     mock_reserved_during_write = mock_reserved_during_timer = false;
+    mock_erase_without_reservation = false;
     mock_writes = mock_commits = 0;
+    mock_legacy_keys = 3;
+    mock_erase_calls = mock_erase_error_on = mock_commit_error_on = 0;
     mock_write_error = mock_commit_error = mock_timer_error = 0;
 }
 
@@ -51,9 +56,18 @@ void ble_ota_release_reboot(void) { mock_reboot_reserved = false; }
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *out) { *out = 1; return ESP_OK; }
 void nvs_close(nvs_handle_t handle) { staged_length = 0; }
 
+static unsigned legacy_key(const char *key)
+{
+    if (!strcmp(key, "ssid")) return 1;
+    if (!strcmp(key, "pass")) return 2;
+    return 0;
+}
+
 esp_err_t nvs_get_str(nvs_handle_t handle, const char *key, char *out, size_t *length)
 {
-    const char *value = !strcmp(key, "ssid") ? "legacy" : "legacy-pass";
+    unsigned mask = legacy_key(key);
+    if (!(mock_legacy_keys & mask)) return ESP_ERR_NVS_NOT_FOUND;
+    const char *value = mask == 1 ? "legacy" : "legacy-pass";
     if (strlen(value) >= *length) return ESP_ERR_INVALID_ARG;
     strcpy(out, value);
     return ESP_OK;
@@ -85,10 +99,21 @@ esp_err_t nvs_set_blob(nvs_handle_t handle, const char *key, const void *value, 
 esp_err_t nvs_commit(nvs_handle_t handle)
 {
     ++mock_commits;
-    if (mock_commit_error) return mock_commit_error;
+    if (mock_commit_error && (!mock_commit_error_on || mock_commits == mock_commit_error_on)) return mock_commit_error;
     if (staged_length) {
         memcpy(stored, staging, staged_length);
         stored_length = staged_length;
     }
+    return ESP_OK;
+}
+
+esp_err_t nvs_erase_key(nvs_handle_t handle, const char *key)
+{
+    ++mock_erase_calls;
+    if (!mock_reboot_reserved) mock_erase_without_reservation = true;
+    unsigned mask = legacy_key(key);
+    if (!(mock_legacy_keys & mask)) return ESP_ERR_NVS_NOT_FOUND;
+    if (mock_erase_error_on == mask) return ESP_FAIL;
+    mock_legacy_keys &= ~mask;
     return ESP_OK;
 }

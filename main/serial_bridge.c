@@ -8,6 +8,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
@@ -18,6 +19,7 @@
 static const char *TAG = "serial";
 
 #define SINK_MAX 4
+#define SERIAL_INPUT_QUEUE_DEPTH 4
 
 typedef struct {
     bool              used;
@@ -27,6 +29,7 @@ typedef struct {
 
 static sink_t     s_sinks[SINK_MAX];
 static SemaphoreHandle_t s_sinks_mtx;
+static QueueHandle_t s_uart_tx;
 static uart_port_t s_port = UART_NUM_1;
 static int         s_baud = 115200;
 static atomic_uint s_dropped_bytes[SERIAL_OUTPUT_COUNT];
@@ -76,13 +79,11 @@ esp_err_t serial_bridge_init(void)
     return ESP_OK;
 }
 
-bool serial_bridge_to_target(const uint8_t *data, size_t len)
+esp_err_t serial_bridge_to_target(const serial_input_chunk_t *chunk, TickType_t timeout)
 {
-    if (data == NULL || len == 0) {
-        return false;
-    }
-    int written = uart_write_bytes(s_port, (const char *)data, len);
-    return written == (int)len;
+    if (!chunk || !chunk->len || chunk->len > sizeof(chunk->data)) return ESP_ERR_INVALID_ARG;
+    if (!s_uart_tx) return ESP_ERR_INVALID_STATE;
+    return xQueueSend(s_uart_tx, chunk, timeout) == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t serial_bridge_subscribe(serial_sink_fn_t fn, int opaque)
@@ -144,45 +145,63 @@ int serial_bridge_get_baud(void)
     return s_baud;
 }
 
+static void serial_rx_step(serial_input_chunk_t *pending)
+{
+    uint8_t buf[SERIAL_BRIDGE_CHUNK_SIZE];
+    int n = uart_read_bytes(s_port, buf, sizeof(buf), pdMS_TO_TICKS(10));
+    if (n > 0) {
+        usb_dev_cdc_write(buf, (size_t)n);
+        serial_sink_fn_t fns[SINK_MAX];
+        int opaques[SINK_MAX];
+        int count = 0;
+        if (xSemaphoreTake(s_sinks_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+            for (int i = 0; i < SINK_MAX; ++i) {
+                if (s_sinks[i].used) {
+                    fns[count] = s_sinks[i].fn;
+                    opaques[count] = s_sinks[i].opaque;
+                    ++count;
+                }
+            }
+            xSemaphoreGive(s_sinks_mtx);
+        }
+        for (int i = 0; i < count; ++i) fns[i](opaques[i], buf, (size_t)n);
+    }
+
+    /* Keep one CDC chunk on congestion so the USB RX FIFO applies backpressure. */
+    if (!pending->len) pending->len = usb_dev_cdc_read(pending->data, sizeof(pending->data));
+    if (pending->len && serial_bridge_to_target(pending, 0) == ESP_OK) pending->len = 0;
+}
+
 static void serial_task(void *arg)
 {
     (void)arg;
-    uint8_t buf[SERIAL_BRIDGE_CHUNK_SIZE];
+    serial_input_chunk_t pending = {0};
+    for (;;) serial_rx_step(&pending);
+}
 
+static void uart_tx_task(void *arg)
+{
+    (void)arg;
+    serial_input_chunk_t chunk;
     for (;;) {
-        /* 目标 -> 上位机 */
-        int n = uart_read_bytes(s_port, buf, sizeof(buf), pdMS_TO_TICKS(10));
-        if (n > 0) {
-            usb_dev_cdc_write(buf, (size_t)n);
-
-            /* 先取快照再加锁外调用，避免回调里的阻塞 send 把订阅操作卡住 */
-            serial_sink_fn_t fns[SINK_MAX];
-            int opaques[SINK_MAX];
-            int count = 0;
-            if (s_sinks_mtx && xSemaphoreTake(s_sinks_mtx, pdMS_TO_TICKS(50)) == pdTRUE) {
-                for (int i = 0; i < SINK_MAX; ++i) {
-                    if (s_sinks[i].used && s_sinks[i].fn) {
-                        fns[count] = s_sinks[i].fn;
-                        opaques[count] = s_sinks[i].opaque;
-                        ++count;
-                    }
-                }
-                xSemaphoreGive(s_sinks_mtx);
-            }
-            for (int i = 0; i < count; ++i) {
-                fns[i](opaques[i], buf, (size_t)n);
-            }
-        }
-
-        /* 上位机(CDC) -> 目标 */
-        size_t m = usb_dev_cdc_read(buf, sizeof(buf));
-        if (m > 0) {
-            serial_bridge_to_target(buf, m);
-        }
+        if (xQueueReceive(s_uart_tx, &chunk, portMAX_DELAY) != pdTRUE) continue;
+        if (uart_write_bytes(s_port, (const char *)chunk.data, chunk.len) != (int)chunk.len)
+            ESP_LOGE(TAG, "目标 UART 写入失败 (%u 字节)", (unsigned)chunk.len);
     }
 }
 
-void serial_bridge_start(void)
+esp_err_t serial_bridge_start(void)
 {
-    xTaskCreate(serial_task, "serial_bridge", 4096, NULL, 8, NULL);
+    if (!s_sinks_mtx) return ESP_ERR_INVALID_STATE;
+    if (s_uart_tx) return ESP_OK;
+    s_uart_tx = xQueueCreate(SERIAL_INPUT_QUEUE_DEPTH, sizeof(serial_input_chunk_t));
+    if (!s_uart_tx) return ESP_ERR_NO_MEM;
+    TaskHandle_t tx_task;
+    if (xTaskCreate(uart_tx_task, "uart_tx", 3072, NULL, 8, &tx_task) == pdPASS) {
+        if (xTaskCreate(serial_task, "serial_bridge", 4096, NULL, 8, NULL) == pdPASS) return ESP_OK;
+        vTaskDelete(tx_task);
+    }
+    vQueueDelete(s_uart_tx);
+    s_uart_tx = NULL;
+    return ESP_ERR_NO_MEM;
 }

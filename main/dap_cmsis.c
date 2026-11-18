@@ -147,7 +147,7 @@ uint32_t dap_cmsis_process(const uint8_t *req, uint32_t req_len,
     }
     if (cmd != CMD_INFO && cmd != CMD_HOST_STATUS && cmd != 0x80 &&
         !dap_session_access(client, cmd == CMD_CONNECT ? DAP_OPEN :
-                           cmd == CMD_DISCONNECT ? DAP_CLOSE : DAP_USE)) {
+                           cmd == CMD_DISCONNECT ? DAP_DISCONNECT : DAP_USE)) {
         resp[1] = cmd == CMD_CONNECT ? 0 : DAP_ERROR;
         if (cmd == CMD_TRANSFER) {
             resp[1] = 0;

@@ -5,10 +5,13 @@
 bool dap_session_access(dap_client_t *client, dap_access_t access)
 {
     dap_session_t *session = client->session;
-    if (session->held && (session->sink != client->sink || session->token != client->token)) return false;
+    if (session->held && (session->sink != client->sink || session->token != client->token)) {
+        /* Remote close may clean the caller's handle table after a handoff. */
+        return access == DAP_CLOSE;
+    }
     client->used = true;
 
-    if (access == DAP_CLOSE) {
+    if (access == DAP_CLOSE || access == DAP_DISCONNECT) {
         session->held = false;
         return true;
     }

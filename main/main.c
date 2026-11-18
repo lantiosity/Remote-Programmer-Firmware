@@ -73,9 +73,8 @@ void app_main(void)
     }
 
     err = serial_bridge_init();
-    if (err == ESP_OK) {
-        serial_bridge_start();
-    } else {
+    if (err == ESP_OK) err = serial_bridge_start();
+    if (err != ESP_OK) {
         healthy = false;
         ESP_LOGE(TAG, "串口桥初始化失败: %s", esp_err_to_name(err));
     }

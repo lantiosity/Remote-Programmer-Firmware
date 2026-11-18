@@ -13,6 +13,6 @@ typedef struct { int baud_rate, data_bits, parity, stop_bits, flow_ctrl, source_
 static inline int uart_driver_install(int p,int rx,int tx,int n,void *q,int flags) { return 0; }
 static inline int uart_param_config(int p,const uart_config_t *c) { return 0; }
 static inline int uart_set_pin(int p,int tx,int rx,int rts,int cts) { return 0; }
-static inline int uart_write_bytes(int p,const char *data,size_t len) { return (int)len; }
-static inline int uart_read_bytes(int p,void *data,size_t len,unsigned ticks) { return 0; }
+int uart_write_bytes(int p,const char *data,size_t len);
+int uart_read_bytes(int p,void *data,size_t len,unsigned ticks);
 static inline int uart_set_baudrate(int p,unsigned baud) { return 0; }

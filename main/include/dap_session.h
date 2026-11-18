@@ -12,6 +12,7 @@ typedef enum {
     DAP_OPEN,
     DAP_LOCK,
     DAP_UNLOCK,
+    DAP_DISCONNECT,
     DAP_CLOSE,
 } dap_access_t;
 

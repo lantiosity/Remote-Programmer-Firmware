@@ -66,8 +66,8 @@ core = ctypes.CDLL(str(core_library))
 serial_library = BUILD / ('serial.dll' if os.name == 'nt' else 'serial.so')
 subprocess.run([GCC, '-shared', '-fPIC', *(['-Wl,--export-all-symbols'] if os.name == 'nt' else []),
                 '-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-parameter',
-                '-I'+str(ROOT/'tests/native/include'),'-I'+str(ROOT/'main/include'),
-                str(ROOT/'main/serial_bridge.c'),str(ROOT/'tests/native/serial_backend.c'),
+                '-I'+str(ROOT/'tests/native/include'),'-I'+str(ROOT/'main/include'),'-I'+str(ROOT/'main'),
+                str(ROOT/'tests/native/serial_backend.c'),
                 '-o',str(serial_library)], check=True)
 serial = ctypes.CDLL(str(serial_library))
 
@@ -195,13 +195,13 @@ class LinkTests(unittest.TestCase):
         data = json.dumps({'id': 42, 'request': name, 'arguments': args}).encode()
         return json.loads(self.exchange(sink, data, token))
 
-    def test_active_writer_rejects_usb_and_wireless_connect_reset_and_close(self):
+    def test_active_writer_rejects_usb_and_wireless_bus_commands(self):
         self.assertEqual(self.remote(self.TCP, 'open')['status'], 0)
         handle = self.remote(self.TCP, 'get_memory_interface_for_ap', [1, 0])['result']
         self.assertEqual(self.remote(self.TCP, 'write_block8', [handle, 0, [1, 2]])['status'], 0)
         self.assertEqual(self.remote(self.BLE, 'readprop', ['unique_id'])['result'], 'native-test')
         self.assertGreater(len(self.exchange(self.USB, b'\x00\x03')), 2)  # DAP_Info
-        for command in ('connect', 'reset', 'close', 'disconnect', 'lock'):
+        for command in ('connect', 'reset', 'disconnect', 'lock'):
             self.assertIn('owned', self.remote(self.BLE, command)['error'])
         for command, status in [(2, 0), (3, 255), (10, 255), (17, 255)]:
             self.assertEqual(self.exchange(self.USB, bytes([command, 0]))[:2], bytes([command, status]))
@@ -234,6 +234,20 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(self.remote(self.TCP, 'close')['status'], 0)
         self.assertNotEqual(self.remote(self.TCP, 'read_mem', [handle, 0, 32])['status'], 0)
         self.assertEqual(self.exchange(self.USB, b'\x02\x01'), b'\x02\x01')
+
+    def test_tcp_close_after_ble_handoff_only_clears_tcp_handles(self):
+        self.assertEqual(self.remote(self.TCP, 'open')['status'], 0)
+        tcp_handle = self.remote(self.TCP, 'get_memory_interface_for_ap', [1, 4])['result']
+        self.assertEqual(self.remote(self.TCP, 'disconnect')['status'], 0)
+        self.assertEqual(self.remote(self.BLE, 'connect')['status'], 0)
+        ble_handle = self.remote(self.BLE, 'get_memory_interface_for_ap', [1, 7])['result']
+        self.assertEqual(self.remote(self.TCP, 'close')['status'], 0)
+        self.assertEqual(counter('test_disconnects'), 1)
+        self.assertEqual(self.remote(self.BLE, 'write_block8', [ble_handle, 0, [5]])['status'], 0)
+        self.assertEqual(counter('test_apsel'), 7)
+        self.assertIn('owned', self.remote(self.TCP, 'reset')['error'])
+        self.assertEqual(self.remote(self.BLE, 'close')['status'], 0)
+        self.assertNotEqual(self.remote(self.TCP, 'read_mem', [tcp_handle, 0, 32])['status'], 0)
 
     def test_owner_released_by_generation_timeout_or_response_failure(self):
         self.assertEqual(self.remote(self.TCP, 'open')['status'], 0)
@@ -325,6 +339,27 @@ class SerialTests(unittest.TestCase):
         self.assertEqual(ctypes.c_uint.in_dll(serial,'mock_locks_held').value,0)
         self.assertEqual(ctypes.c_uint.in_dll(serial,'mock_lock_errors').value,0)
 
+    def test_uart_tx_backpressure_keeps_rx_running_and_retries_the_pending_cdc_chunk(self):
+        self.assertEqual(serial.serial_bridge_init(), 0)
+        self.assertEqual(serial.test_start_uart_tx(), 0)
+        self.assertEqual(serial.test_subscribe(1), 0)
+        self.addCleanup(serial.test_unsubscribe, 1)
+        for byte in range(1, 5):
+            self.assertEqual(serial.test_queue_uart_byte(byte), 0)
+        self.assertEqual(serial.test_queue_uart_byte(9), 0x107)
+        for _ in range(2):
+            serial.test_serial_rx_step()
+        self.assertEqual(ctypes.c_uint.in_dll(serial, 'mock_cdc_reads').value, 1)
+        self.assertEqual(ctypes.c_uint.in_dll(serial, 'mock_cdc_writes').value, 2)
+        self.assertEqual(ctypes.c_uint.in_dll(serial, 'mock_sink_calls').value, 2)
+        self.assertEqual(ctypes.c_uint.in_dll(serial, 'mock_uart_writes').value, 0)
+        self.assertEqual(serial.test_dequeue_uart_byte(), 1)
+        serial.test_serial_rx_step()
+        self.assertEqual(ctypes.c_uint.in_dll(serial, 'mock_cdc_reads').value, 1)
+        self.assertEqual([serial.test_dequeue_uart_byte() for _ in range(5)], [2, 3, 4, 0xa1, -1])
+        serial.test_serial_rx_step()
+        self.assertEqual(serial.test_dequeue_uart_byte(), 0xa2)
+
 
 class OtaAuthorizationTests(unittest.TestCase):
     def test_transport_masks_and_expiry(self):
@@ -391,11 +426,47 @@ class WifiConfigTests(unittest.TestCase):
                 self.assertEqual(config.cfg_wifi_set(ssid, b'new-pass', 1500), 0)
                 self.assertEqual(config.cfg_init(), 0)
                 self.assertEqual(self.credentials(), (ssid, b'new-pass'))
+        self.assertEqual(self.count('mock_legacy_keys'), 3)
         for _ in range(2):
             self.flag('mock_reboot_reserved').value = False
             self.assertEqual(config.cfg_wifi_clear(1500), 0)
             self.assertEqual(config.cfg_init(), 0)
             self.assertIsNone(self.credentials())
+            self.assertEqual(self.count('mock_legacy_keys'), 0)
+        self.assertFalse(self.flag('mock_erase_without_reservation').value)
+
+    def test_legacy_clear_retries_failed_erases_and_final_commit(self):
+        for erase_error_on, commit_error_on, remaining_keys in [(1, 0, 3), (2, 0, 2), (0, 2, 0)]:
+            with self.subTest(erase=erase_error_on, commit=commit_error_on):
+                self.setUp()
+                erase = ctypes.c_uint.in_dll(config, 'mock_erase_error_on')
+                commit = ctypes.c_int.in_dll(config, 'mock_commit_error')
+                erase.value = erase_error_on
+                if commit_error_on:
+                    commit.value = -1
+                    ctypes.c_uint.in_dll(config, 'mock_commit_error_on').value = commit_error_on
+                self.assertEqual(config.cfg_wifi_clear(1500), -1)
+                self.assertFalse(self.flag('mock_timer_scheduled').value)
+                self.assertFalse(self.flag('mock_reboot_reserved').value)
+                self.assertEqual(self.count('mock_legacy_keys'), remaining_keys)
+                self.assertEqual(config.cfg_init(), 0)
+                self.assertIsNone(self.credentials())
+                erase.value = 0
+                commit.value = 0
+                self.assertEqual(config.cfg_wifi_clear(1500), 0)
+                self.assertEqual(self.count('mock_legacy_keys'), 0)
+                self.assertTrue(self.flag('mock_timer_scheduled').value)
+
+    def test_failed_empty_record_commit_leaves_legacy_keys_for_retry(self):
+        commit = ctypes.c_int.in_dll(config, 'mock_commit_error')
+        commit.value = -1
+        self.assertEqual(config.cfg_wifi_clear(1500), -1)
+        self.assertEqual(self.count('mock_erase_calls'), 0)
+        self.assertEqual(self.count('mock_legacy_keys'), 3)
+        self.assertEqual(self.credentials(), (b'legacy', b'legacy-pass'))
+        commit.value = 0
+        self.assertEqual(config.cfg_wifi_clear(1500), 0)
+        self.assertEqual(self.count('mock_legacy_keys'), 0)
 
     def test_timer_failure_releases_reboot_reservation(self):
         error = ctypes.c_int.in_dll(config, 'mock_timer_error')

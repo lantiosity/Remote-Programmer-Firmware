@@ -165,6 +165,12 @@ static esp_err_t schedule_reserved_reboot(uint32_t delay_ms)
     return esp_timer_start_once(s_reboot_timer, (uint64_t)delay_ms * 1000u);
 }
 
+static esp_err_t erase_legacy_wifi_key(nvs_handle_t h, const char *key)
+{
+    esp_err_t err = nvs_erase_key(h, key);
+    return err == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : err;
+}
+
 static esp_err_t save_wifi(const wifi_credentials_t *wifi, uint32_t reboot_delay_ms)
 {
     if (!s_reboot_timer || !reboot_delay_ms) return ESP_ERR_INVALID_ARG;
@@ -175,6 +181,13 @@ static esp_err_t save_wifi(const wifi_credentials_t *wifi, uint32_t reboot_delay
     if (h) {
         err = nvs_set_blob(h, KEY_WIFI, wifi, sizeof(*wifi));
         if (err == ESP_OK) err = nvs_commit(h);
+        /* Publish the empty record before touching legacy keys so this
+         * firmware never falls back to a partially cleared legacy pair. */
+        if (err == ESP_OK && !wifi->ssid[0]) {
+            err = erase_legacy_wifi_key(h, KEY_SSID);
+            if (err == ESP_OK) err = erase_legacy_wifi_key(h, KEY_PASS);
+            if (err == ESP_OK) err = nvs_commit(h);
+        }
         nvs_close(h);
     }
     if (err == ESP_OK) {
@@ -200,7 +213,7 @@ esp_err_t cfg_wifi_set(const char *ssid, const char *pass, uint32_t reboot_delay
 
 esp_err_t cfg_wifi_clear(uint32_t reboot_delay_ms)
 {
-    /* An empty record also overrides older keys and compile-time defaults. */
+    /* An empty record overrides compile-time defaults on this firmware. */
     const wifi_credentials_t empty = {0};
     return save_wifi(&empty, reboot_delay_ms);
 }

@@ -415,7 +415,8 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
                  !strcmp(name, "is_reset_asserted") || !strcmp(name, "has_swo");
     dap_access_t access = DAP_USE;
     if (!strcmp(name, "open") || !strcmp(name, "connect")) access = DAP_OPEN;
-    else if (!strcmp(name, "close") || !strcmp(name, "disconnect")) access = DAP_CLOSE;
+    else if (!strcmp(name, "close")) access = DAP_CLOSE;
+    else if (!strcmp(name, "disconnect")) access = DAP_DISCONNECT;
     else if (!strcmp(name, "lock")) access = DAP_LOCK;
     else if (!strcmp(name, "unlock")) access = DAP_UNLOCK;
     if (!query && !dap_session_access(client, access)) {

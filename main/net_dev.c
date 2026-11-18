@@ -288,7 +288,7 @@ static void tcp_serial_task(void *arg)
 {
     (void)arg;
     const int port = cfg_serial_tcp_port();
-    uint8_t buf[1024];
+    serial_input_chunk_t chunk = {0};
 
     for (;;) {
         int srv = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -344,11 +344,13 @@ static void tcp_serial_task(void *arg)
             ESP_LOGI(TAG, "串口客户端 %s:%d 已连接", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
 
             for (;;) {
-                int n = recv(fd, buf, sizeof(buf), 0);
+                int n = recv(fd, chunk.data, sizeof(chunk.data), 0);
                 if (n <= 0) {
                     break;
                 }
-                serial_bridge_to_target(buf, (size_t)n);
+                chunk.len = (size_t)n;
+                /* Wait in this socket's reader only, allowing TCP flow control. */
+                if (serial_bridge_to_target(&chunk, portMAX_DELAY) != ESP_OK) break;
             }
             serial_bridge_unsubscribe(serial_tcp_sink, token);
             xSemaphoreTake(s_serial_send_lock, portMAX_DELAY);

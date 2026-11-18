@@ -127,6 +127,8 @@ has_swo（返回 false）, swo_*（返回错误）, jtag_sequence（返回错误
 
 USB、WiFi 和 BLE 的 SWD 操作由单个会话独占。只读设备查询可在占用期间执行。remote `lock` 支持嵌套，`unlock` 释放一级锁。已打开的会话继续持有 SWD，直到关闭、断连或空闲 120 秒。竞争的 remote 请求返回探针错误，USB 按对应 CMSIS-DAP 命令返回失败。调试器长时间空闲后应重新连接目标。
 
+remote 会话交出 SWD 后仍可用 `close` 清理自己的 AP handle。当前 SWD 所有者可以继续操作。
+
 探针复位命令需要 nRESET。由主机调试器发起的软件复位需要先选定目标核及其 MEM-AP。
 
 参数大小：TCP 一次最多收 20KB 的 JSON 行（够 `write_block32` 写 1KB 页），
@@ -164,6 +166,8 @@ UART1 (GPIO17/18)
 
 USB CDC、TCP 和 BLE NUS 分别使用有界发送队列。慢客户端只影响自己的输出，队列满时丢弃新数据。发送时核对连接代号，控制台 `status` 可查看每条链路的累计丢弃字节数。TCP 和 BLE 通过 `serial_bridge_subscribe(fn, opaque)` 注册非阻塞投递回调。
 
+发往目标的字节由独立 UART TX 任务从一个四槽队列取出，每槽最多 512 字节。队列满时，CDC 暂存一块已读取的数据，TCP 通过接收窗口施加背压，BLE 带应答的写入返回 ATT 资源不足。BLE 写应答成功表示已入队。
+
 ## 8. SWD 时序实现要点
 
 - **可选 SPI2**：`swdspi on` 申请 SPI2 独占总线并启用 FIFO 轮询，SWJ 序列仍由 GPIO 执行。SPI mode 0、LSB-first、手动控制 SWDIO 输出使能；分阶段发送请求、读取 ACK，再决定后续方向和时钟。使用 80 MHz 源向下分频，当前实际最高 40 MHz，低于 78.125 kHz 时使用普通 GPIO。读路径通过首个有效 DP IDCODE 自动校准接收位对齐；33 位写路径使用 1 位 command + 32 位 FIFO data。详见 [SPI2 SWD](SWD_SPI2.md)。
@@ -191,6 +195,7 @@ USB CDC、TCP 和 BLE NUS 分别使用有界发送队列。慢客户端只影响
 | `tcp_serial` | 4KB | 7 | 串口 TCP 服务 |
 | `tcp_serial_tx` / `cdc_tx` | 各 3KB | 7 | 独立发送 WiFi 串口和 USB CDC 数据 |
 | `serial_bridge` | 4KB | 8 | UART ↔ CDC/各路订阅者 |
+| `uart_tx` | 3KB | 8 | 从输入队列向目标 UART 写入 |
 | NimBLE host | 默认 | — | GATT 服务 |
 | esp_console REPL | 5KB | — | 控制台 |
 

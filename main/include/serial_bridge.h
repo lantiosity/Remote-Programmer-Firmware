@@ -8,6 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,6 +17,11 @@ extern "C" {
 typedef bool (*serial_sink_fn_t)(int opaque, const uint8_t *data, size_t len);
 
 #define SERIAL_BRIDGE_CHUNK_SIZE 512
+
+typedef struct {
+    size_t len;
+    uint8_t data[SERIAL_BRIDGE_CHUNK_SIZE];
+} serial_input_chunk_t;
 
 typedef struct {
     int token;
@@ -36,10 +42,10 @@ uint32_t serial_bridge_dropped_bytes(serial_output_t output);
 esp_err_t serial_bridge_init(void);
 
 /** 启动收发任务（init 之后调用） */
-void serial_bridge_start(void);
+esp_err_t serial_bridge_start(void);
 
-/** 向目标串口写数据 */
-bool serial_bridge_to_target(const uint8_t *data, size_t len);
+/** 为目标 UART 排队一个完整数据块。timeout=0 时立即报告队列拥塞。 */
+esp_err_t serial_bridge_to_target(const serial_input_chunk_t *chunk, TickType_t timeout);
 
 /** 订阅"来自目标串口"的数据。回调只能执行非阻塞投递。 */
 esp_err_t serial_bridge_subscribe(serial_sink_fn_t fn, int opaque);
