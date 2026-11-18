@@ -46,6 +46,10 @@ static int cmd_status(int argc, char **argv)
     printf("SWD 时钟   : %" PRIu32 " kHz\n", probe_get_clock() / 1000u);
     printf("DP IDCODE  : 0x%08" PRIx32 "\n", probe_idcode());
     printf("目标串口   : %d baud\n", serial_bridge_get_baud());
+    printf("串口丢弃字节: USB=%" PRIu32 " TCP=%" PRIu32 " BLE=%" PRIu32 "\n",
+           serial_bridge_dropped_bytes(SERIAL_OUTPUT_USB),
+           serial_bridge_dropped_bytes(SERIAL_OUTPUT_TCP),
+           serial_bridge_dropped_bytes(SERIAL_OUTPUT_BLE));
     printf("请求统计   : USB=%" PRIu32 " TCP=%" PRIu32 " BLE=%" PRIu32
            " 丢弃=%" PRIu32 " 最大长度=%" PRIu32 "\n",
            st.usb_req, st.tcp_req, st.ble_req, st.dropped, st.max_req_len);
@@ -128,18 +132,22 @@ static int cmd_wifi(int argc, char **argv)
         return 0;
     }
     if (argc == 2 && strcmp(argv[1], "-c") == 0) {
-        cfg_wifi_clear();
-        printf("已清除 WiFi 配置，重启后只开热点\n");
+        esp_err_t err = cfg_wifi_clear(500);
+        if (err != ESP_OK) {
+            printf("清除失败: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("已清除 WiFi 配置，正在重启…\n");
         return 0;
     }
     if (argc >= 2) {
         const char *pass = (argc >= 3) ? argv[2] : "";
-        if (cfg_wifi_set(argv[1], pass) != ESP_OK) {
-            printf("保存失败\n");
+        esp_err_t err = cfg_wifi_set(argv[1], pass, 500);
+        if (err != ESP_OK) {
+            printf("保存失败: %s\n", esp_err_to_name(err));
             return 1;
         }
         printf("已保存 WiFi: %s，正在重启…\n", argv[1]);
-        cfg_reboot_later(500);
         return 0;
     }
     return 0;
@@ -191,17 +199,17 @@ static int cmd_wifihex(int argc, char **argv)
     }
     uint8_t ssid[33] = {0};
     int n = hex_to_bytes(hex, ssid, 32);
-    if (n <= 0) {
+    if (n <= 0 || memchr(ssid, '\0', (size_t)n)) {
         printf("十六进制格式错误\n");
         return 1;
     }
     const char *pass = (argc >= 3) ? argv[2] : "";
-    if (cfg_wifi_set((const char *)ssid, pass) != ESP_OK) {
-        printf("保存失败\n");
+    esp_err_t err = cfg_wifi_set((const char *)ssid, pass, 500);
+    if (err != ESP_OK) {
+        printf("保存失败: %s\n", esp_err_to_name(err));
         return 1;
     }
     printf("已保存 WiFi(%d 字节) 和密码，正在重启…\n", n);
-    cfg_reboot_later(500);
     return 0;
 }
 
@@ -653,7 +661,11 @@ static int cmd_reset(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
-    probe_reset_target();
+    probe_status_t status = probe_reset_target();
+    if (status != PROBE_OK) {
+        printf("目标复位失败（状态 %d）；请连接并配置 nRESET\n", status);
+        return 1;
+    }
     printf("已复位目标\n");
     return 0;
 }
@@ -676,8 +688,12 @@ static int cmd_reboot(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+    esp_err_t err = cfg_reboot_later(200);
+    if (err != ESP_OK) {
+        printf("重启请求失败: %s\n", esp_err_to_name(err));
+        return 1;
+    }
     printf("重启中…\n");
-    cfg_reboot_later(200);
     return 0;
 }
 
@@ -717,6 +733,11 @@ static int cmd_selftest(int argc, char **argv)
     static int name(int argc, char **argv)                                \
     {                                                                    \
         probe_lock();                                                    \
+        if (link_swd_session_active()) {                                 \
+            probe_unlock();                                              \
+            printf("SWD 正被调试会话占用\n");                            \
+            return 1;                                                    \
+        }                                                                \
         int r = fn(argc, argv);                                          \
         probe_unlock();                                                  \
         return r;                                                        \

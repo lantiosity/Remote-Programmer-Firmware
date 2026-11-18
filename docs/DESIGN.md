@@ -48,7 +48,7 @@
 | `probe_core.c` | DP/AP 传输、AP posted-read 处理、MEM-AP 内存/块访问、复位 |
 | `dap_cmsis.c` | CMSIS-DAP v1 命令层（64 字节报文），给 Keil/pyOCD/OpenOCD 用 |
 | `dap_server.c` | pyOCD remote 探针 JSON 协议服务端 |
-| `link.c` | 请求队列 + DAP 工作线程 + 各链路发送函数注册 |
+| `link.c` / `dap_session.c` | DAP 工作线程、按链路和连接代号管理 SWD 独占 |
 | `usb_dev.c` | TinyUSB 描述符、HID 收发回调、CDC 虚拟串口 |
 | `net_dev.c` | WiFi STA+AP、TCP 5555（DAP）/5556（串口） |
 | `ble_dev.c` | NimBLE GATT：DAP 服务 + NUS 服务 |
@@ -85,7 +85,7 @@ CMSIS-DAP v1 用 HID 传输的好处：Windows 免驱，Keil/OpenOCD 开箱即�
 | DAP_TransferAbort | 0x07 | ✅（同步实现，置位即可） |
 | DAP_WriteABORT | 0x08 | ✅ 写 DP ABORT（清 sticky error） |
 | DAP_Delay | 0x09 | ✅ |
-| DAP_ResetTarget | 0x0A | ✅ 拉低 NRST 20ms 后重新线复位；无 NRST 时用 SYSRESETREQ |
+| DAP_ResetTarget | 0x0A | ✅ 通过已配置的 nRESET 拉低 20 ms 后重新线复位。未配置 nRESET 时返回错误 |
 | DAP_SWJ_Pins | 0x10 | ✅ SWCLK/SWDIO/NRESET |
 | DAP_SWJ_Clock | 0x11 | ✅ 请求设置 10 kHz–50 MHz，实际频率受 GPIO 执行开销限制 |
 | DAP_SWJ_Sequence | 0x12 | ✅ 最多 256 位（0 表示 256） |
@@ -125,6 +125,10 @@ has_swo（返回 false）, swo_*（返回错误）, jtag_sequence（返回错误
 `readprop` 支持：`unique_id`、`vendor_name`、`product_name`、`description`、
 `supported_wire_protocols`、`wire_protocol`、`capabilities`。
 
+USB、WiFi 和 BLE 的 SWD 操作由单个会话独占。只读设备查询可在占用期间执行。remote `lock` 支持嵌套，`unlock` 释放一级锁。已打开的会话继续持有 SWD，直到关闭、断连或空闲 120 秒。竞争的 remote 请求返回探针错误，USB 按对应 CMSIS-DAP 命令返回失败。调试器长时间空闲后应重新连接目标。
+
+探针复位命令需要 nRESET。由主机调试器发起的软件复位需要先选定目标核及其 MEM-AP。
+
 参数大小：TCP 一次最多收 20KB 的 JSON 行（够 `write_block32` 写 1KB 页），
 `read_block32` / `read_ap_multiple` 响应最多 1856 字；`read_block8` 最多 5104 字节。响应头预算 64 字节，uint32/byte 十进制元素最坏分别为 11/4 字符（含逗号）。`write_block32` / `write_ap_multiple` 数组最多 2048 字，`write_block8` 最多 5104 字节且整条 JSON 必须小于 20480 字节；4096 字节页写已回归。非法或过长数组整体报错，不会部分写入。
 
@@ -158,7 +162,7 @@ UART1 (GPIO17/18)
    └─ TCP 5556 收
 ```
 
-订阅者用 `serial_bridge_subscribe(fn, opaque)` 注册，最多 4 个。
+USB CDC、TCP 和 BLE NUS 分别使用有界发送队列。慢客户端只影响自己的输出，队列满时丢弃新数据。发送时核对连接代号，控制台 `status` 可查看每条链路的累计丢弃字节数。TCP 和 BLE 通过 `serial_bridge_subscribe(fn, opaque)` 注册非阻塞投递回调。
 
 ## 8. SWD 时序实现要点
 
@@ -185,6 +189,7 @@ UART1 (GPIO17/18)
 | `tusb` (esp_tinyusb) | 4KB | 10 | USB 协议栈 |
 | `tcp_dap` | 6KB | 9 | DAP TCP 服务（单客户端） |
 | `tcp_serial` | 4KB | 7 | 串口 TCP 服务 |
+| `tcp_serial_tx` / `cdc_tx` | 各 3KB | 7 | 独立发送 WiFi 串口和 USB CDC 数据 |
 | `serial_bridge` | 4KB | 8 | UART ↔ CDC/各路订阅者 |
 | NimBLE host | 默认 | — | GATT 服务 |
 | esp_console REPL | 5KB | — | 控制台 |

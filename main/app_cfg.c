@@ -9,16 +9,18 @@
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include "nvs.h"
-#include "nvs_flash.h"
 
 #include "app_cfg.h"
+#include "ble_ota.h"
 
 static const char *TAG = "cfg";
 
 #define NVS_NAMESPACE "swdlink"
 #define KEY_SSID      "ssid"
 #define KEY_PASS      "pass"
+#define KEY_WIFI      "wifi_v1"
 #define KEY_BAUD      "baud"
 
 static const cfg_probe_pins_t s_pins = {
@@ -29,8 +31,13 @@ static const cfg_probe_pins_t s_pins = {
 };
 
 static char s_serial[24];
-static char s_ssid[33];
-static char s_pass[65];
+typedef struct {
+    char ssid[33];
+    char pass[65];
+} wifi_credentials_t;
+
+static wifi_credentials_t s_wifi;
+static portMUX_TYPE s_wifi_lock = portMUX_INITIALIZER_UNLOCKED;
 static int  s_baud = CONFIG_TARGET_UART_BAUD;
 static esp_timer_handle_t s_reboot_timer;
 static void reboot_timer_cb(void *arg);
@@ -66,24 +73,26 @@ esp_err_t cfg_init(void)
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_serial, sizeof(s_serial), "ESP-SWD-%02X%02X%02X", mac[3], mac[4], mac[5]);
 
-    s_ssid[0] = '\0';
-    s_pass[0] = '\0';
-    if (strlen(CONFIG_LINK_WIFI_SSID) > 0) {
-        snprintf(s_ssid, sizeof(s_ssid), "%s", CONFIG_LINK_WIFI_SSID);
-        snprintf(s_pass, sizeof(s_pass), "%s", CONFIG_LINK_WIFI_PASSWORD);
-    }
+    s_wifi = (wifi_credentials_t){0};
+    snprintf(s_wifi.ssid, sizeof(s_wifi.ssid), "%s", CONFIG_LINK_WIFI_SSID);
+    snprintf(s_wifi.pass, sizeof(s_wifi.pass), "%s", CONFIG_LINK_WIFI_PASSWORD);
 
     nvs_handle_t h = open_nvs();
     if (h == 0) {
         return ESP_OK;
     }
-    char tmp_ssid[33] = {0};
-    char tmp_pass[65] = {0};
-    load_str(h, KEY_SSID, tmp_ssid, sizeof(tmp_ssid));
-    load_str(h, KEY_PASS, tmp_pass, sizeof(tmp_pass));
-    if (strlen(tmp_ssid) > 0) {
-        snprintf(s_ssid, sizeof(s_ssid), "%s", tmp_ssid);
-        snprintf(s_pass, sizeof(s_pass), "%s", tmp_pass);
+    wifi_credentials_t saved = {0};
+    size_t length = sizeof(saved);
+    esp_err_t err = nvs_get_blob(h, KEY_WIFI, &saved, &length);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        load_str(h, KEY_SSID, saved.ssid, sizeof(saved.ssid));
+        load_str(h, KEY_PASS, saved.pass, sizeof(saved.pass));
+        if (saved.ssid[0]) s_wifi = saved;
+    } else if (err == ESP_OK && length == sizeof(saved) &&
+               saved.ssid[sizeof(saved.ssid) - 1] == '\0' && saved.pass[sizeof(saved.pass) - 1] == '\0') {
+        s_wifi = saved;
+    } else {
+        ESP_LOGW(TAG, "读取 WiFi 凭据失败: %s", err == ESP_OK ? "invalid record" : esp_err_to_name(err));
     }
     int32_t baud = 0;
     if (nvs_get_i32(h, KEY_BAUD, &baud) == ESP_OK && baud > 0) {
@@ -93,7 +102,7 @@ esp_err_t cfg_init(void)
 
     ESP_LOGI(TAG, "序列号=%s, SWD=%d kHz, WiFi=%s, UART baud=%d",
              s_serial, (int)(s_pins.clock_hz / 1000),
-             s_ssid[0] ? s_ssid : "(未配置, 仅热点)", s_baud);
+             s_wifi.ssid[0] ? s_wifi.ssid : "(未配置, 仅热点)", s_baud);
     return ESP_OK;
 }
 
@@ -139,46 +148,61 @@ esp_err_t cfg_uart_set_baud(int baud)
 
 bool cfg_wifi_get(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
 {
+    portENTER_CRITICAL(&s_wifi_lock);
+    wifi_credentials_t wifi = s_wifi;
+    portEXIT_CRITICAL(&s_wifi_lock);
     if (ssid && ssid_len) {
-        snprintf(ssid, ssid_len, "%s", s_ssid);
+        snprintf(ssid, ssid_len, "%s", wifi.ssid);
     }
     if (pass && pass_len) {
-        snprintf(pass, pass_len, "%s", s_pass);
+        snprintf(pass, pass_len, "%s", wifi.pass);
     }
-    return s_ssid[0] != '\0';
+    return wifi.ssid[0] != '\0';
 }
 
-esp_err_t cfg_wifi_set(const char *ssid, const char *pass)
+static esp_err_t schedule_reserved_reboot(uint32_t delay_ms)
 {
-    if (ssid == NULL || strlen(ssid) == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
-    snprintf(s_pass, sizeof(s_pass), "%s", pass ? pass : "");
+    return esp_timer_start_once(s_reboot_timer, (uint64_t)delay_ms * 1000u);
+}
+
+static esp_err_t save_wifi(const wifi_credentials_t *wifi, uint32_t reboot_delay_ms)
+{
+    if (!s_reboot_timer || !reboot_delay_ms) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = ble_ota_reserve_reboot();
+    if (err != ESP_OK) return err;
     nvs_handle_t h = open_nvs();
-    if (h == 0) {
-        return ESP_FAIL;
+    err = ESP_FAIL;
+    if (h) {
+        err = nvs_set_blob(h, KEY_WIFI, wifi, sizeof(*wifi));
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
     }
-    nvs_set_str(h, KEY_SSID, s_ssid);
-    nvs_set_str(h, KEY_PASS, s_pass);
-    esp_err_t err = nvs_commit(h);
-    nvs_close(h);
+    if (err == ESP_OK) {
+        portENTER_CRITICAL(&s_wifi_lock);
+        s_wifi = *wifi;
+        portEXIT_CRITICAL(&s_wifi_lock);
+        err = schedule_reserved_reboot(reboot_delay_ms);
+    }
+    if (err != ESP_OK) ble_ota_release_reboot();
     return err;
 }
 
-esp_err_t cfg_wifi_clear(void)
+esp_err_t cfg_wifi_set(const char *ssid, const char *pass, uint32_t reboot_delay_ms)
 {
-    s_ssid[0] = '\0';
-    s_pass[0] = '\0';
-    nvs_handle_t h = open_nvs();
-    if (h == 0) {
-        return ESP_FAIL;
-    }
-    nvs_erase_key(h, KEY_SSID);
-    nvs_erase_key(h, KEY_PASS);
-    esp_err_t err = nvs_commit(h);
-    nvs_close(h);
-    return err;
+    wifi_credentials_t wifi = {0};
+    size_t pass_len = pass ? strlen(pass) : 0;
+    if (!ssid || !ssid[0] || strlen(ssid) >= sizeof(wifi.ssid) ||
+        (pass_len && pass_len < 8) || pass_len >= sizeof(wifi.pass)) return ESP_ERR_INVALID_ARG;
+    snprintf(wifi.ssid, sizeof(wifi.ssid), "%s", ssid);
+    snprintf(wifi.pass, sizeof(wifi.pass), "%s", pass ? pass : "");
+    return save_wifi(&wifi, reboot_delay_ms);
+}
+
+esp_err_t cfg_wifi_clear(uint32_t reboot_delay_ms)
+{
+    /* An empty record also overrides older keys and compile-time defaults. */
+    const wifi_credentials_t empty = {0};
+    return save_wifi(&empty, reboot_delay_ms);
 }
 
 const char *cfg_serial_number(void)
@@ -207,9 +231,12 @@ static void reboot_timer_cb(void *arg)
     esp_restart();
 }
 
-void cfg_reboot_later(uint32_t delay_ms)
+esp_err_t cfg_reboot_later(uint32_t delay_ms)
 {
-    /* Created once during startup. First pending request wins; start_once is
-     * thread-safe and returns INVALID_STATE when already scheduled. */
-    if (s_reboot_timer) (void)esp_timer_start_once(s_reboot_timer, (uint64_t)delay_ms * 1000u);
+    if (!s_reboot_timer || !delay_ms) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = ble_ota_reserve_reboot();
+    if (err != ESP_OK) return err;
+    err = schedule_reserved_reboot(delay_ms);
+    if (err != ESP_OK) ble_ota_release_reboot();
+    return err;
 }

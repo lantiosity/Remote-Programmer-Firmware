@@ -86,11 +86,18 @@ typedef struct {
     unsigned retries;
     uint8_t data[];
 } notify_packet_t;
-static QueueHandle_t s_tx_queue;
+static QueueHandle_t s_dap_tx_queue, s_nus_tx_queue;
 static struct ble_npl_event s_tx_ev;
 static struct ble_npl_callout s_tx_retry;
 static notify_packet_t *s_active;
 static atomic_int s_overflow = ATOMIC_VAR_INIT(-1);
+
+static void free_notify_packet(notify_packet_t *packet)
+{
+    if (packet && packet->handle == s_nus_tx_handle && packet->offset < packet->len)
+        serial_bridge_note_drop(SERIAL_OUTPUT_BLE, packet->len - packet->offset);
+    free(packet);
+}
 
 static void ble_tx_worker(struct ble_npl_event *ev)
 {
@@ -100,12 +107,13 @@ static void ble_tx_worker(struct ble_npl_event *ev)
         (void)ble_gap_terminate((uint16_t)token, BLE_ERR_REM_USER_CONN_TERM);
     }
     while (!s_active || s_active->token != token) {
-        free(s_active);
+        free_notify_packet(s_active);
         s_active = NULL;
-        if (xQueueReceive(s_tx_queue, &s_active, 0) != pdTRUE) return;
+        if (xQueueReceive(s_dap_tx_queue, &s_active, 0) != pdTRUE &&
+            xQueueReceive(s_nus_tx_queue, &s_active, 0) != pdTRUE) return;
     }
     if (s_active->handle == s_nus_tx_handle && !atomic_load(&s_nus_notify)) {
-        free(s_active);
+        free_notify_packet(s_active);
         s_active = NULL;
         (void)ble_npl_callout_reset(&s_tx_retry, ble_npl_time_ms_to_ticks32(1));
         return;
@@ -122,6 +130,11 @@ static void ble_tx_worker(struct ble_npl_event *ev)
     if (!rc) {
         s_active->offset += n;
         s_active->retries = 0;
+    } else if (s_active->handle == s_nus_tx_handle) {
+        free_notify_packet(s_active);
+        s_active = NULL;
+        (void)ble_npl_callout_reset(&s_tx_retry, ble_npl_time_ms_to_ticks32(1));
+        return;
     } else if (rc != BLE_HS_ENOMEM || ++s_active->retries > 200) {
         ESP_LOGW(TAG, "BLE notify failed rc=%d; closing incomplete stream", rc);
         (void)ble_gap_terminate(conn, BLE_ERR_REM_USER_CONN_TERM);
@@ -135,25 +148,26 @@ static void ble_tx_worker(struct ble_npl_event *ev)
 
 static bool notify_enqueue(int token, uint16_t handle, const uint8_t *data, size_t len, bool dap)
 {
+    QueueHandle_t queue = dap ? s_dap_tx_queue : s_nus_tx_queue;
     if (!s_ready || token < 0 || token != atomic_load(&s_token) || !handle ||
-        !data || !len || len > DAP_JSON_BUF || !s_tx_queue) return false;
+        !data || !len || len > DAP_JSON_BUF || !queue) return false;
     if (!(dap ? atomic_load(&s_dap_notify) : atomic_load(&s_nus_notify))) return false;
     notify_packet_t *packet = malloc(sizeof(*packet) + len + (dap ? 1 : 0));
     if (!packet) {
-        link_note_drop();
         if (dap) {
+            link_note_drop();
             atomic_store(&s_overflow, token);
             ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
-        }
+        } else serial_bridge_note_drop(SERIAL_OUTPUT_BLE, len);
         return false;
     }
     *packet = (notify_packet_t){.token=token, .handle=handle, .len=len + (dap ? 1 : 0)};
     memcpy(packet->data, data, len);
     if (dap) packet->data[len] = '\n';
-    if (xQueueSend(s_tx_queue, &packet, dap ? pdMS_TO_TICKS(200) : 0) != pdTRUE) {
-        free(packet);
-        link_note_drop();
+    if (xQueueSend(queue, &packet, dap ? pdMS_TO_TICKS(200) : 0) != pdTRUE) {
+        free_notify_packet(packet);
         if (dap) {
+            link_note_drop();
             atomic_store(&s_overflow, token);
             ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
         }
@@ -299,6 +313,20 @@ static const struct ble_gatt_svc_def s_svcs[] = {
 
 static void advertise(void);
 
+static void clear_connection(uint16_t conn)
+{
+    ble_ota_disconnected(conn);
+    wifi_setup_disconnected(conn);
+    int token = atomic_exchange(&s_token, -1);
+    link_session_set(LINK_SINK_BLE, -1);
+    serial_bridge_unsubscribe(ble_serial_sink, token);
+    s_dap_notify = false;
+    s_nus_notify = false;
+    s_conn = BLE_HS_CONN_HANDLE_NONE;
+    s_rx_len = 0;
+    ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
+}
+
 static int gap_event(struct ble_gap_event *event, void *arg)
 {
     (void)arg;
@@ -326,17 +354,8 @@ static int gap_event(struct ble_gap_event *event, void *arg)
 
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "BLE 断开 (reason=%d)", event->disconnect.reason);
-        ble_ota_disconnected(event->disconnect.conn.conn_handle);
-        wifi_setup_disconnected(event->disconnect.conn.conn_handle);
         if (event->disconnect.conn.conn_handle != s_conn) return 0;
-        serial_bridge_unsubscribe(ble_serial_sink, atomic_load(&s_token));
-        atomic_store(&s_token, -1);
-        s_dap_notify = false;
-        s_nus_notify = false;
-        link_session_set(LINK_SINK_BLE, -1);
-        ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_tx_ev);
-        s_conn = BLE_HS_CONN_HANDLE_NONE;
-        s_rx_len = 0;
+        clear_connection(s_conn);
         advertise();
         return 0;
 
@@ -404,6 +423,7 @@ static void on_sync(void)
 static void on_reset(int reason)
 {
     ESP_LOGW(TAG, "NimBLE 复位, reason=%d", reason);
+    if (s_conn != BLE_HS_CONN_HANDLE_NONE) clear_connection(s_conn);
 }
 
 static void host_task(void *param)
@@ -433,8 +453,14 @@ esp_err_t ble_dev_init(void)
     ble_ota_enable_notifications();
 
     ble_npl_event_init(&s_tx_ev, ble_tx_worker, NULL);
-    s_tx_queue = xQueueCreate(8, sizeof(notify_packet_t *));
-    if (!s_tx_queue) return ESP_ERR_NO_MEM;
+    s_dap_tx_queue = xQueueCreate(8, sizeof(notify_packet_t *));
+    s_nus_tx_queue = xQueueCreate(4, sizeof(notify_packet_t *));
+    if (!s_dap_tx_queue || !s_nus_tx_queue) {
+        if (s_dap_tx_queue) vQueueDelete(s_dap_tx_queue);
+        if (s_nus_tx_queue) vQueueDelete(s_nus_tx_queue);
+        s_dap_tx_queue = s_nus_tx_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     ble_npl_callout_init(&s_tx_retry, nimble_port_get_dflt_eventq(), ble_tx_worker, NULL);
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;

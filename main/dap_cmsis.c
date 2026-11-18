@@ -72,10 +72,14 @@ static const char *TAG = "dap";
 #define DAP_OK                  0x00
 #define DAP_ERROR               0xFF
 
-static uint8_t s_port = 0;          /* 0=未连接, 1=SWD */
-static uint8_t s_pins_out = 0;
 static uint32_t s_match_mask = 0;
 static uint16_t s_match_retry = 0;
+
+void dap_cmsis_reset_session(void)
+{
+    s_match_mask = 0;
+    s_match_retry = 0;
+}
 
 /* DAP_Transfer 的请求字不是线上的 8 位 SWD 请求帧。CMSIS-DAP 使用
  * bit0=APnDP、bit1=RnW、bit[3:2]=A[3:2]，其余为 match/timestamp 标志。 */
@@ -128,7 +132,7 @@ static uint32_t add_info_string(uint8_t *resp, uint32_t resp_size, const char *s
 }
 
 uint32_t dap_cmsis_process(const uint8_t *req, uint32_t req_len,
-                           uint8_t *resp, uint32_t resp_size)
+                           uint8_t *resp, uint32_t resp_size, dap_client_t *client)
 {
     if (req_len == 0 || resp_size < 2) {
         return 0;
@@ -136,6 +140,31 @@ uint32_t dap_cmsis_process(const uint8_t *req, uint32_t req_len,
 
     const uint8_t cmd = req[0];
     resp[0] = cmd;
+
+    if (cmd == CMD_CONNECT && req_len > 1 && req[1] > 1) {
+        resp[1] = 0;
+        return 2;
+    }
+    if (cmd != CMD_INFO && cmd != CMD_HOST_STATUS && cmd != 0x80 &&
+        !dap_session_access(client, cmd == CMD_CONNECT ? DAP_OPEN :
+                           cmd == CMD_DISCONNECT ? DAP_CLOSE : DAP_USE)) {
+        resp[1] = cmd == CMD_CONNECT ? 0 : DAP_ERROR;
+        if (cmd == CMD_TRANSFER) {
+            resp[1] = 0;
+            resp[2] = SWD_ACK_ERROR;
+            return 3;
+        }
+        if (cmd == CMD_TRANSFER_BLOCK) {
+            resp[1] = resp[2] = 0;
+            resp[3] = SWD_ACK_ERROR;
+            return 4;
+        }
+        if (cmd == CMD_RESET_TARGET) {
+            resp[2] = 0;
+            return 3;
+        }
+        return 2;
+    }
 
     switch (cmd) {
     case 0x80: /* CMSIS-DAP vendor self-OTA extension */
@@ -192,24 +221,12 @@ uint32_t dap_cmsis_process(const uint8_t *req, uint32_t req_len,
         resp[1] = DAP_OK;
         return 2;
 
-    case CMD_CONNECT: {
-        uint8_t port = (req_len > 1) ? req[1] : 0;
-        if (port == 0) {
-            port = 1;   /* 默认端口 -> SWD */
-        }
-        if (port != 1) {          /* 只支持 SWD */
-            resp[1] = 0;
-            return 2;
-        }
+    case CMD_CONNECT:
         (void)probe_connect();
-        s_port = 1;
         resp[1] = 1;
         return 2;
-    }
 
     case CMD_DISCONNECT:
-        (void)probe_disconnect();
-        s_port = 0;
         resp[1] = DAP_OK;
         return 2;
 
@@ -232,7 +249,8 @@ uint32_t dap_cmsis_process(const uint8_t *req, uint32_t req_len,
     case CMD_RESET_TARGET: {
         probe_status_t st = probe_reset_target();
         resp[1] = (st == PROBE_OK) ? DAP_OK : DAP_ERROR;
-        return 2;
+        resp[2] = 0; /* No device-specific reset sequence was executed. */
+        return 3;
     }
 
     case CMD_SWJ_PINS: {
@@ -240,7 +258,6 @@ uint32_t dap_cmsis_process(const uint8_t *req, uint32_t req_len,
             uint8_t out = req[1];
             uint8_t sel = req[2];
             uint32_t wait_us = rd_u32(&req[3]);
-            s_pins_out = (uint8_t)((s_pins_out & ~sel) | (out & sel));
             probe_pins_write(sel, out);
             if (wait_us) {
                 probe_delay_us(wait_us);

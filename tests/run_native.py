@@ -32,14 +32,17 @@ for result, name, args in re.findall(r'\b(esp_err_t|probe_status_t|bool|uint32_t
 library = BUILD / ('remote.dll' if os.name == 'nt' else 'remote.so')
 subprocess.run([GCC, '-shared', '-fPIC', *(['-Wl,--export-all-symbols'] if os.name == 'nt' else []), '-std=c11', '-Wall', '-Wextra', '-Werror',
                 '-Wno-unused-parameter', '-I' + str(ROOT / 'tests/native/include'),
-                '-I' + str(ROOT / 'main/include'), '-I' + str(CJSON),
-                str(ROOT / 'main/dap_server.c'), str(CJSON / 'cJSON.c'),
+                '-I' + str(ROOT / 'main/include'), '-I' + str(ROOT / 'main'), '-I' + str(CJSON),
+                str(ROOT / 'main/dap_server.c'), str(ROOT / 'main/dap_cmsis.c'),
+                str(ROOT / 'main/dap_session.c'), str(CJSON / 'cJSON.c'),
                 str(BUILD / 'remote_backend.c'), '-lm', '-o', str(library)], check=True)
 if os.name == 'nt':
     _dll_path = os.add_dll_directory(str(Path(GCC).parent))
 lib = ctypes.CDLL(str(library))
-lib.dap_server_process.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
-lib.dap_server_process.restype = ctypes.c_size_t
+lib.test_remote_process.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+lib.test_remote_process.restype = ctypes.c_size_t
+lib.test_link_request.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p]
+lib.test_link_request.restype = ctypes.c_size_t
 lib.test_ota_window.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_uint, ctypes.c_uint]
 lib.test_ota_window.restype = ctypes.c_bool
 
@@ -68,6 +71,17 @@ subprocess.run([GCC, '-shared', '-fPIC', *(['-Wl,--export-all-symbols'] if os.na
                 '-o',str(serial_library)], check=True)
 serial = ctypes.CDLL(str(serial_library))
 
+config_library = BUILD / ('config.dll' if os.name == 'nt' else 'config.so')
+subprocess.run([GCC, '-shared', '-fPIC', *(['-Wl,--export-all-symbols'] if os.name == 'nt' else []),
+                '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+                '-I' + str(ROOT / 'tests/native/include'), '-I' + str(ROOT / 'main/include'),
+                str(ROOT / 'main/app_cfg.c'), str(ROOT / 'tests/native/config_backend.c'),
+                '-o', str(config_library)], check=True)
+config = ctypes.CDLL(str(config_library))
+config.cfg_wifi_set.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+config.cfg_wifi_get.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
+config.cfg_wifi_get.restype = ctypes.c_bool
+
 
 def counter(name):
     return ctypes.c_uint.in_dll(lib, name).value
@@ -76,7 +90,7 @@ def counter(name):
 def request(name, args, ident=1, raw=None):
     text = (raw or json.dumps({'id': ident, 'request': name, 'arguments': args}, separators=(',', ':'))).encode()
     output = ctypes.create_string_buffer(20480)
-    size = lib.dap_server_process(text, len(text), output, len(output))
+    size = lib.test_remote_process(text, len(text), output, len(output))
     result = json.loads(output.raw[:size])
     assert size < len(output)
     return result
@@ -85,7 +99,7 @@ def request(name, args, ident=1, raw=None):
 class RemoteTests(unittest.TestCase):
     def setUp(self):
         lib.dap_server_select_session(0)
-        lib.dap_server_reset_session()
+        lib.dap_server_reset_handles()
         ctypes.c_uint.in_dll(lib, 'test_calls').value = 0
         self.handle = request('get_memory_interface_for_ap', [1, 7])['result']
 
@@ -166,6 +180,79 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(bytes((ctypes.c_uint8*8192).in_dll(lib,'test_data'))[:7],b'\xff'*7)
 
 
+class LinkTests(unittest.TestCase):
+    USB, TCP, BLE = range(3)
+
+    def setUp(self):
+        lib.test_link_init()
+
+    def exchange(self, sink, data, token=1):
+        output = ctypes.create_string_buffer(20480)
+        size = lib.test_link_request(sink, token, data, len(data), output)
+        return output.raw[:size]
+
+    def remote(self, sink, name, args=(), token=1):
+        data = json.dumps({'id': 42, 'request': name, 'arguments': args}).encode()
+        return json.loads(self.exchange(sink, data, token))
+
+    def test_active_writer_rejects_usb_and_wireless_connect_reset_and_close(self):
+        self.assertEqual(self.remote(self.TCP, 'open')['status'], 0)
+        handle = self.remote(self.TCP, 'get_memory_interface_for_ap', [1, 0])['result']
+        self.assertEqual(self.remote(self.TCP, 'write_block8', [handle, 0, [1, 2]])['status'], 0)
+        self.assertEqual(self.remote(self.BLE, 'readprop', ['unique_id'])['result'], 'native-test')
+        self.assertGreater(len(self.exchange(self.USB, b'\x00\x03')), 2)  # DAP_Info
+        for command in ('connect', 'reset', 'close', 'disconnect', 'lock'):
+            self.assertIn('owned', self.remote(self.BLE, command)['error'])
+        for command, status in [(2, 0), (3, 255), (10, 255), (17, 255)]:
+            self.assertEqual(self.exchange(self.USB, bytes([command, 0]))[:2], bytes([command, status]))
+        self.assertEqual(self.remote(self.TCP, 'write_block8', [handle, 2, [3, 4]])['status'], 0)
+        self.assertEqual((counter('test_connects'), counter('test_resets'), counter('test_disconnects')), (1, 0, 0))
+        self.assertEqual(self.remote(self.TCP, 'close')['status'], 0)
+        self.assertEqual(self.exchange(self.USB, b'\x02\x01'), b'\x02\x01')
+        self.assertIn('owned', self.remote(self.TCP, 'reset')['error'])
+
+    def test_nested_remote_lock_releases_only_after_final_unlock(self):
+        for _ in range(2):
+            self.assertEqual(self.remote(self.BLE, 'lock')['status'], 0)
+        self.assertEqual(self.remote(self.BLE, 'set_clock', [1000])['status'], 0)
+        self.assertEqual(self.remote(self.BLE, 'unlock')['status'], 0)
+        self.assertIn('owned', self.remote(self.TCP, 'connect')['error'])
+        self.assertEqual(self.remote(self.BLE, 'unlock')['status'], 0)
+        self.assertEqual(self.remote(self.TCP, 'connect')['status'], 0)
+        self.assertEqual(self.remote(self.TCP, 'lock')['status'], 0)
+        self.assertEqual(self.remote(self.TCP, 'unlock')['status'], 0)
+        self.assertIn('owned', self.remote(self.BLE, 'connect')['error'])
+
+    def test_disconnect_releases_bus_and_preserves_handles_until_close(self):
+        self.assertEqual(self.remote(self.TCP, 'connect')['status'], 0)
+        handle = self.remote(self.TCP, 'get_memory_interface_for_ap', [1, 0])['result']
+        self.assertEqual(self.remote(self.TCP, 'disconnect')['status'], 0)
+        self.assertEqual(self.exchange(self.USB, b'\x02\x01'), b'\x02\x01')
+        self.assertEqual(self.exchange(self.USB, b'\x03'), b'\x03\x00')
+        self.assertEqual(self.remote(self.TCP, 'connect')['status'], 0)
+        self.assertEqual(self.remote(self.TCP, 'read_mem', [handle, 0, 32])['status'], 0)
+        self.assertEqual(self.remote(self.TCP, 'close')['status'], 0)
+        self.assertNotEqual(self.remote(self.TCP, 'read_mem', [handle, 0, 32])['status'], 0)
+        self.assertEqual(self.exchange(self.USB, b'\x02\x01'), b'\x02\x01')
+
+    def test_owner_released_by_generation_timeout_or_response_failure(self):
+        self.assertEqual(self.remote(self.TCP, 'open')['status'], 0)
+        handle = self.remote(self.TCP, 'get_memory_interface_for_ap', [1, 0])['result']
+        lib.link_session_set(self.TCP, 2)
+        self.assertEqual(self.exchange(self.TCP, b'{"request":"reset"}', token=1), b'')
+        self.assertNotEqual(self.remote(self.TCP, 'read_mem', [handle, 0, 32], token=2)['status'], 0)
+        self.assertEqual(self.remote(self.TCP, 'connect', token=2)['status'], 0)
+        ctypes.c_int64.in_dll(lib, 'test_now').value += 119_000_000
+        self.assertEqual(self.remote(self.TCP, 'readprop', ['unique_id'], token=2)['status'], 0)
+        ctypes.c_int64.in_dll(lib, 'test_now').value += 1_000_000
+        lib.test_link_poll()
+        ctypes.c_bool.in_dll(lib, 'test_send_failed').value = True
+        self.assertEqual(self.exchange(self.USB, b'\x02\x01'), b'\x02\x01')
+        ctypes.c_bool.in_dll(lib, 'test_send_failed').value = False
+        self.assertEqual(self.remote(self.BLE, 'connect')['status'], 0)
+        self.assertEqual(counter('test_disconnects'), 3)
+
+
 class MemoryTests(unittest.TestCase):
     def setUp(self):
         self.memory = (ctypes.c_uint8 * 16384).in_dll(core, 'model_memory')
@@ -211,6 +298,14 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(bytes(data),bytes(self.memory[:4096]))
         self.assertLess(ctypes.c_uint.in_dll(core,'model_transfers').value,1200)
 
+    def test_reset_without_nreset_reports_failure_without_writing_dp(self):
+        core.test_disable_nreset()
+        ctypes.c_uint.in_dll(core, 'model_fault').value = 1
+        transfers = ctypes.c_uint.in_dll(core, 'model_transfers')
+        before = transfers.value
+        self.assertNotEqual(core.probe_reset_target(), 0)
+        self.assertEqual(transfers.value, before)
+
 
 class SerialTests(unittest.TestCase):
     def test_duplicate_subscribe_unsubscribe_and_full_table(self):
@@ -241,6 +336,75 @@ class OtaAuthorizationTests(unittest.TestCase):
                     self.assertFalse(lib.test_ota_window(101,100,allowed,transport))
         self.assertTrue(lib.test_ota_window(2**40,2**40+1,1,1))
         self.assertFalse(lib.test_ota_window(1,0,7,7))
+
+
+class WifiConfigTests(unittest.TestCase):
+    def setUp(self):
+        config.test_cfg_reset()
+        self.assertEqual(config.cfg_init(), 0)
+
+    def flag(self, name):
+        return ctypes.c_bool.in_dll(config, name)
+
+    def count(self, name):
+        return ctypes.c_uint.in_dll(config, name).value
+
+    def credentials(self):
+        ssid, password = ctypes.create_string_buffer(33), ctypes.create_string_buffer(65)
+        configured = config.cfg_wifi_get(ssid, len(ssid), password, len(password))
+        return (ssid.value, password.value) if configured else None
+
+    def test_reboot_reserved_before_nvs_write_and_held_until_restart(self):
+        self.flag('mock_ota_active').value = True
+        self.assertNotEqual(config.cfg_wifi_set(b'new', b'new-pass', 1500), 0)
+        self.assertNotEqual(config.cfg_wifi_clear(1500), 0)
+        self.assertNotEqual(config.cfg_reboot_later(500), 0)
+        self.assertEqual(self.count('mock_writes'), 0)
+        self.flag('mock_ota_active').value = False
+        self.assertEqual(config.cfg_wifi_set(b'new', b'new-pass', 1500), 0)
+        for flag in ('mock_reserved_during_write', 'mock_reserved_during_timer',
+                     'mock_reboot_reserved', 'mock_timer_scheduled'):
+            self.assertTrue(self.flag(flag).value)
+        self.assertNotEqual(config.cfg_wifi_clear(1500), 0)
+        self.assertEqual(self.count('mock_writes'), 1)
+        self.assertEqual(self.credentials(), (b'new', b'new-pass'))
+
+    def test_nvs_write_and_commit_failures_preserve_the_previous_pair(self):
+        for flag, error in [('mock_write_error', 0x1105), ('mock_commit_error', -1)]:
+            with self.subTest(flag=flag):
+                injected = ctypes.c_int.in_dll(config, flag)
+                injected.value = error
+                self.assertEqual(config.cfg_wifi_set(b'new', b'new-pass', 1500), error)
+                self.assertEqual(self.credentials(), (b'legacy', b'legacy-pass'))
+                self.assertFalse(self.flag('mock_reboot_reserved').value)
+                self.assertFalse(self.flag('mock_timer_scheduled').value)
+                self.assertEqual(config.cfg_init(), 0)
+                self.assertEqual(self.credentials(), (b'legacy', b'legacy-pass'))
+                injected.value = 0
+        self.assertEqual(self.count('mock_commits'), 1)
+        self.assertEqual(config.cfg_wifi_set(b'new', b'new-pass', 1500), 0)
+
+    def test_full_byte_ssid_and_clear_survive_restart(self):
+        for ssid in [b'A' * 31, b'A' * 32, ('网' * 10 + 'é').encode()]:
+            with self.subTest(ssid=ssid):
+                self.flag('mock_reboot_reserved').value = False
+                self.assertEqual(config.cfg_wifi_set(ssid, b'new-pass', 1500), 0)
+                self.assertEqual(config.cfg_init(), 0)
+                self.assertEqual(self.credentials(), (ssid, b'new-pass'))
+        for _ in range(2):
+            self.flag('mock_reboot_reserved').value = False
+            self.assertEqual(config.cfg_wifi_clear(1500), 0)
+            self.assertEqual(config.cfg_init(), 0)
+            self.assertIsNone(self.credentials())
+
+    def test_timer_failure_releases_reboot_reservation(self):
+        error = ctypes.c_int.in_dll(config, 'mock_timer_error')
+        error.value = -1
+        self.assertEqual(config.cfg_wifi_clear(1500), -1)
+        self.assertFalse(self.flag('mock_reboot_reserved').value)
+        self.assertFalse(self.flag('mock_timer_scheduled').value)
+        error.value = 0
+        self.assertEqual(config.cfg_reboot_later(500), 0)
 
 
 if __name__ == '__main__':

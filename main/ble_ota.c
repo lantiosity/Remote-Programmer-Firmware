@@ -40,7 +40,7 @@ static bool s_notifications_ready;
 static uint16_t s_status_handle, s_owner = BLE_HS_CONN_HANDLE_NONE;
 static uint8_t s_state, s_op;
 static uint32_t s_received, s_total, s_error, s_session, s_epoch;
-static bool s_busy, s_cancel;
+static bool s_busy, s_cancel, s_reboot_reserved;
 static int64_t s_armed_until, s_last_activity;
 static unsigned s_armed_transports;
 static esp_ota_handle_t s_handle;
@@ -82,7 +82,7 @@ static void status_for_transport(unsigned transport, uint8_t out[20])
     out[0] = 1;
     out[1] = s_state == ARMED && !armed ? IDLE : s_state;
     out[2] = s_op;
-    out[3] = (armed ? 1 : 0) | (s_busy ? 2 : 0);
+    out[3] = (armed ? 1 : 0) | ((s_busy || s_cancel || s_reboot_reserved) ? 2 : 0);
     put32(out + 4, s_received);
     put32(out + 8, s_total);
     put32(out + 12, s_error);
@@ -100,12 +100,33 @@ void ble_ota_status_for(uint16_t owner, uint8_t out[20])
     status_for_transport(owner_transport(owner), out);
 }
 
+static bool ota_active(void)
+{
+    return s_busy || s_cancel || (s_state >= PREPARING && s_state <= REBOOTING);
+}
+
 bool ble_ota_in_progress(void)
 {
     portENTER_CRITICAL(&s_lock);
-    bool active = s_busy || (s_state >= PREPARING && s_state <= REBOOTING);
+    bool active = ota_active();
     portEXIT_CRITICAL(&s_lock);
     return active;
+}
+
+esp_err_t ble_ota_reserve_reboot(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    bool available = !s_reboot_reserved && !ota_active();
+    if (available) s_reboot_reserved = true;
+    portEXIT_CRITICAL(&s_lock);
+    return available ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+void ble_ota_release_reboot(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_reboot_reserved = false;
+    portEXIT_CRITICAL(&s_lock);
 }
 
 size_t ble_ota_info(char *out, size_t capacity)
@@ -210,7 +231,7 @@ esp_err_t ble_ota_arm_transport(uint32_t seconds, unsigned transports)
     if (seconds > 600 || !transports || (transports & ~OTA_ALLOW_ALL)) return ESP_ERR_INVALID_ARG;
     int64_t deadline = esp_timer_get_time() + (int64_t)seconds * 1000000;
     portENTER_CRITICAL(&s_lock);
-    if (s_busy || (s_state >= PREPARING && s_state <= REBOOTING)) {
+    if (s_reboot_reserved || ota_active()) {
         portEXIT_CRITICAL(&s_lock);
         return ESP_ERR_INVALID_STATE;
     }
@@ -369,7 +390,7 @@ esp_err_t ble_ota_submit(uint16_t owner, uint8_t op, const uint8_t *payload, siz
     if (length) memcpy(job.payload, payload, length);
     int64_t now = esp_timer_get_time();
     portENTER_CRITICAL(&s_lock);
-    if (s_busy || s_cancel || s_state == REBOOTING) {
+    if (s_reboot_reserved || s_busy || s_cancel || s_state == REBOOTING) {
         portEXIT_CRITICAL(&s_lock); return ESP_ERR_INVALID_STATE;
     }
     bool active = s_state >= PREPARING && s_state <= READY;
@@ -428,13 +449,14 @@ static void worker(void *arg)
         bool cancel = s_cancel;
         uint32_t epoch = s_epoch;
         s_cancel = false;
+        if (cancel) s_busy = true;
         int64_t confirm_at = s_confirm_at;
         bool healthy = s_boot_healthy;
         portEXIT_CRITICAL(&s_lock);
         if (cancel) {
             discard();
-            publish(ERROR, ABORT, ERR_DISCONNECTED);
             portENTER_CRITICAL(&s_lock); s_owner = BLE_HS_CONN_HANDLE_NONE; portEXIT_CRITICAL(&s_lock);
+            publish(ERROR, ABORT, ERR_DISCONNECTED);
         }
         if (have_job && job.epoch == epoch && !cancel) process(&job);
         int64_t now = esp_timer_get_time();

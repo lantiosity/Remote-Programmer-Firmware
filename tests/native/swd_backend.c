@@ -1,10 +1,17 @@
 #include <string.h>
 #include "probe_swd.h"
+#include "probe_core.h"
 
 uint8_t model_memory[16384];
 uint32_t model_csw = 0x23000052, model_tar, model_posted;
 unsigned model_transfers, model_tar_writes, model_fault;
 unsigned mock_lock_errors, mock_locks_held;
+
+void test_disable_nreset(void)
+{
+    const probe_core_cfg_t config = {.nrst_gpio = -1, .clock_hz = 1000000};
+    probe_init(&config);
+}
 
 uint8_t probe_swd_transfer(uint8_t request, uint32_t *data)
 {

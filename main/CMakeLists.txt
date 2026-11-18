@@ -7,6 +7,7 @@ idf_component_register(
         "probe_core.c"
         "dap_cmsis.c"
         "dap_server.c"
+        "dap_session.c"
         "link.c"
         "usb_dev.c"
         "net_dev.c"

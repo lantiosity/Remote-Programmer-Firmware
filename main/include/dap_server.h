@@ -11,6 +11,7 @@
 #pragma once
 
 #include <stddef.h>
+#include "dap_session.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,10 +33,8 @@ extern "C" {
  * @param out_size   响应缓冲大小
  * @return 响应文本长度（>0），不含结尾换行；0 表示无响应
  */
-size_t dap_server_process(const char *line, size_t line_len, char *out, size_t out_size);
-
-/** 主动断开当前"远端探针"会话状态（例如链路断开时） */
-void dap_server_reset_session(void);
+size_t dap_server_process(const char *line, size_t line_len, char *out, size_t out_size,
+                          dap_client_t *client);
 /* Worker-only: TCP and BLE have separate handle tables. */
 void dap_server_select_session(unsigned session);
 void dap_server_reset_handles(void);

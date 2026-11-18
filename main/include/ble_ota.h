@@ -11,6 +11,9 @@ void ble_ota_enable_notifications(void);
 const struct ble_gatt_svc_def *ble_ota_services(void);
 void ble_ota_disconnected(uint16_t conn);
 bool ble_ota_in_progress(void);
+/* Reserve a non-OTA reboot before persisting configuration or starting its timer. */
+esp_err_t ble_ota_reserve_reboot(void);
+void ble_ota_release_reboot(void);
 esp_err_t ble_ota_arm(uint32_t seconds);
 #define OTA_ALLOW_USB 1u
 #define OTA_ALLOW_WIFI 2u

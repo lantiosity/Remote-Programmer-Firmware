@@ -2,3 +2,6 @@
 static inline void vTaskDelay(unsigned ticks) { }
 static inline int xTaskCreate(void (*fn)(void *), const char *name, unsigned stack,
                               void *arg, unsigned priority, void *handle) { return 1; }
+static inline int xTaskCreatePinnedToCore(void (*fn)(void *), const char *name, unsigned stack,
+                                          void *arg, unsigned priority, void *handle, int core)
+{ return xTaskCreate(fn, name, stack, arg, priority, handle); }

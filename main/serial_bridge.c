@@ -3,6 +3,7 @@
  * @brief  目标串口桥：UART <-> USB CDC / BLE NUS / TCP
  */
 #include <string.h>
+#include <stdatomic.h>
 
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -17,7 +18,6 @@
 static const char *TAG = "serial";
 
 #define SINK_MAX 4
-#define BUF_SIZE 512
 
 typedef struct {
     bool              used;
@@ -29,6 +29,17 @@ static sink_t     s_sinks[SINK_MAX];
 static SemaphoreHandle_t s_sinks_mtx;
 static uart_port_t s_port = UART_NUM_1;
 static int         s_baud = 115200;
+static atomic_uint s_dropped_bytes[SERIAL_OUTPUT_COUNT];
+
+void serial_bridge_note_drop(serial_output_t output, size_t bytes)
+{
+    atomic_fetch_add_explicit(&s_dropped_bytes[output], (unsigned)bytes, memory_order_relaxed);
+}
+
+uint32_t serial_bridge_dropped_bytes(serial_output_t output)
+{
+    return atomic_load_explicit(&s_dropped_bytes[output], memory_order_relaxed);
+}
 
 esp_err_t serial_bridge_init(void)
 {
@@ -136,7 +147,7 @@ int serial_bridge_get_baud(void)
 static void serial_task(void *arg)
 {
     (void)arg;
-    uint8_t buf[BUF_SIZE];
+    uint8_t buf[SERIAL_BRIDGE_CHUNK_SIZE];
 
     for (;;) {
         /* 目标 -> 上位机 */

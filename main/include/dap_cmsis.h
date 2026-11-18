@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "dap_session.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,7 +23,8 @@ extern "C" {
  * @return 响应长度（>0）
  */
 uint32_t dap_cmsis_process(const uint8_t *req, uint32_t req_len,
-                           uint8_t *resp, uint32_t resp_size);
+                           uint8_t *resp, uint32_t resp_size, dap_client_t *client);
+void dap_cmsis_reset_session(void);
 
 #ifdef __cplusplus
 }

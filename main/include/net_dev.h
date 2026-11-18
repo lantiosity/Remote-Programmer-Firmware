@@ -26,9 +26,6 @@ unsigned net_dev_sta_retry_seconds(void);
 /** 供 link 层回调：发送 JSON 行（自动补 '\n'） */
 bool tcp_dap_send(int fd, const uint8_t *data, size_t len);
 
-/** 供串口桥回调：发送原始字节 */
-bool tcp_serial_send(int fd, const uint8_t *data, size_t len);
-
 #ifdef __cplusplus
 }
 #endif

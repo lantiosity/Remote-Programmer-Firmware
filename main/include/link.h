@@ -34,6 +34,8 @@ esp_err_t link_submit(link_sink_t sink, int opaque, const uint8_t *data, size_t 
 /* Transport lifecycle: token includes the connection generation; -1 closes.
  * Only dap_worker applies resets, including when its request queue is full. */
 void link_session_set(link_sink_t sink, int token);
+/* The console calls this with probe_lock held. */
+bool link_swd_session_active(void);
 
 /** 统计信息 */
 typedef struct {

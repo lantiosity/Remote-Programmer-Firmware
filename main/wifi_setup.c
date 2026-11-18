@@ -74,7 +74,6 @@ static void worker(void *unused)
         char *id = strtok_r(job.text, " ", &save);
         char *op = strtok_r(NULL, " ", &save);
         cJSON *root = reply(id ? id : "");
-        bool restart = false;
         if (!op) fail(root, "invalid_request");
         else if (!strcmp(op, "status")) {
             char ssid[33], pass[65], hex[65];
@@ -115,20 +114,19 @@ static void worker(void *unused)
             }
         } else if (!strcmp(op, "save") || !strcmp(op, "clear")) {
             if (!job.usb && !ble_ota_window_for(OTA_ALLOW_BLE)) fail(root, "window_closed");
-            else if (ble_ota_in_progress()) fail(root, "device_busy");
             else {
                 esp_err_t err = ESP_ERR_INVALID_ARG;
-                if (!strcmp(op, "clear")) err = cfg_wifi_clear();
+                if (!strcmp(op, "clear")) err = cfg_wifi_clear(1500);
                 else {
                     char *ssid_hex = strtok_r(NULL, " ", &save), *pass_hex = strtok_r(NULL, " ", &save);
                     char ssid[33] = {0}, pass[65] = {0};
                     if (ssid_hex && pass_hex && hex_decode(ssid_hex, ssid, 32) && ssid[0] &&
                         (!strcmp(pass_hex, "-") || hex_decode(pass_hex, pass, 63)) &&
-                        (!pass[0] || strlen(pass) >= 8)) err = cfg_wifi_set(ssid, pass);
+                        (!pass[0] || strlen(pass) >= 8)) err = cfg_wifi_set(ssid, pass, 1500);
                     memset(pass, 0, sizeof(pass));
                 }
-                if (err != ESP_OK) fail(root, "save_failed");
-                else { cJSON_AddBoolToObject(root, "restarting", true); restart = true; }
+                if (err != ESP_OK) fail(root, err == ESP_ERR_INVALID_STATE ? "device_busy" : "save_failed");
+                else cJSON_AddBoolToObject(root, "restarting", true);
             }
         } else fail(root, "unsupported_operation");
         char encoded[REPLY_SIZE];
@@ -138,7 +136,6 @@ static void worker(void *unused)
         portENTER_CRITICAL(&s_lock);
         memcpy(s_reply, encoded, strlen(encoded) + 1); s_busy = false;
         portEXIT_CRITICAL(&s_lock);
-        if (restart) cfg_reboot_later(1500);
     }
 }
 esp_err_t wifi_setup_init(void)

@@ -15,6 +15,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "lwip/sockets.h"
 
@@ -43,6 +44,7 @@ static volatile uint32_t s_dap_epoch = 0;   /* 每次连接自增，防止 fd �
 static volatile int s_serial_fd = -1;
 static uint32_t s_serial_epoch;
 static SemaphoreHandle_t s_dap_send_lock, s_serial_send_lock;
+static QueueHandle_t s_serial_tx_queue;
 
 static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
@@ -132,18 +134,32 @@ bool tcp_dap_send(int opaque, const uint8_t *data, size_t len)
     /* 协议：一行一条 JSON，响应也要以 '\n' 结尾 */
     static const uint8_t nl = '\n';
     bool ok = send_all(fd, data, len) && send_all(fd, &nl, 1);
+    if (!ok) shutdown(fd, SHUT_RDWR);
     xSemaphoreGive(s_dap_send_lock);
     return ok;
 }
 
-bool tcp_serial_send(int opaque, const uint8_t *data, size_t len)
+static void tcp_serial_tx_task(void *arg)
 {
-    if (!s_serial_send_lock || xSemaphoreTake(s_serial_send_lock, pdMS_TO_TICKS(1100)) != pdTRUE) return false;
-    int fd = opaque & 0xffff;
-    uint32_t epoch = (uint32_t)opaque >> 16;
-    bool ok = fd == s_serial_fd && epoch == (s_serial_epoch & 0x7fffu) && send_all(fd, data, len);
-    xSemaphoreGive(s_serial_send_lock);
-    return ok;
+    (void)arg;
+    serial_output_chunk_t chunk;
+    for (;;) {
+        if (xQueueReceive(s_serial_tx_queue, &chunk, portMAX_DELAY) != pdTRUE) continue;
+        int fd = chunk.token & 0xffff;
+        uint32_t epoch = (uint32_t)chunk.token >> 16;
+        xSemaphoreTake(s_serial_send_lock, portMAX_DELAY);
+        bool current = fd == s_serial_fd && epoch == (s_serial_epoch & 0x7fffu);
+        size_t sent = 0;
+        if (current) {
+            while (sent < chunk.len) {
+                int n = send(fd, chunk.data + sent, chunk.len - sent, 0);
+                if (n <= 0) { shutdown(fd, SHUT_RDWR); break; }
+                sent += (size_t)n;
+            }
+        }
+        xSemaphoreGive(s_serial_send_lock);
+        serial_bridge_note_drop(SERIAL_OUTPUT_TCP, chunk.len - sent);
+    }
 }
 
 /* ---------------- DAP TCP 服务 ---------------- */
@@ -259,9 +275,13 @@ static void tcp_dap_task(void *arg)
 
 /* ---------------- 串口 TCP 桥 ---------------- */
 
-static bool serial_tcp_sink(int fd, const uint8_t *data, size_t len)
+static bool serial_tcp_sink(int token, const uint8_t *data, size_t len)
 {
-    return tcp_serial_send(fd, data, len);
+    serial_output_chunk_t chunk = {.token = token, .len = len};
+    memcpy(chunk.data, data, len);
+    if (xQueueSend(s_serial_tx_queue, &chunk, 0) == pdTRUE) return true;
+    serial_bridge_note_drop(SERIAL_OUTPUT_TCP, len);
+    return false;
 }
 
 static void tcp_serial_task(void *arg)
@@ -400,14 +420,17 @@ esp_err_t net_dev_init(void)
     char ssid[33] = {0};
     char pass[65] = {0};
     if (cfg_wifi_get(ssid, sizeof(ssid), pass, sizeof(pass))) {
-        s_sta_configured = true;
-        wifi_config_t sta_cfg;
-        memset(&sta_cfg, 0, sizeof(sta_cfg));
-        snprintf((char *)sta_cfg.sta.ssid, sizeof(sta_cfg.sta.ssid), "%s", ssid);
-        snprintf((char *)sta_cfg.sta.password, sizeof(sta_cfg.sta.password), "%s", pass);
+        wifi_config_t sta_cfg = {0};
+        memcpy(sta_cfg.sta.ssid, ssid, strnlen(ssid, sizeof(sta_cfg.sta.ssid)));
+        memcpy(sta_cfg.sta.password, pass, strnlen(pass, sizeof(sta_cfg.sta.password)));
         sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-        esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
-        snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
+        err = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "WiFi STA 配置无效，保留热点: %s", esp_err_to_name(err));
+        } else {
+            s_sta_configured = true;
+            snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
+        }
     } else {
         ESP_LOGW(TAG, "未配置 WiFi，只开热点 %s (%s)", CONFIG_LINK_AP_SSID, s_ap_ip);
     }
@@ -422,8 +445,21 @@ esp_err_t net_dev_init(void)
         snprintf(s_ap_ip, sizeof(s_ap_ip), IPSTR, IP2STR(&ip.ip));
     }
 
-    xTaskCreate(tcp_dap_task, "tcp_dap", 6144, NULL, 9, NULL);
-    xTaskCreate(tcp_serial_task, "tcp_serial", 4096, NULL, 7, NULL);
+    if (xTaskCreate(tcp_dap_task, "tcp_dap", 6144, NULL, 9, NULL) != pdPASS) return ESP_ERR_NO_MEM;
+    s_serial_tx_queue = xQueueCreate(4, sizeof(serial_output_chunk_t));
+    if (!s_serial_tx_queue) return ESP_ERR_NO_MEM;
+    TaskHandle_t sender;
+    if (xTaskCreate(tcp_serial_tx_task, "tcp_serial_tx", 3072, NULL, 7, &sender) != pdPASS) {
+        vQueueDelete(s_serial_tx_queue);
+        s_serial_tx_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    if (xTaskCreate(tcp_serial_task, "tcp_serial", 4096, NULL, 7, NULL) != pdPASS) {
+        vTaskDelete(sender);
+        vQueueDelete(s_serial_tx_queue);
+        s_serial_tx_queue = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 
     ESP_LOGI(TAG, "热点: %s，地址 %s", CONFIG_LINK_AP_SSID, s_ap_ip);
     return ESP_OK;

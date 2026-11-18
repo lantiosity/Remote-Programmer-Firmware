@@ -54,6 +54,7 @@ typedef struct {
     size_t cap;
     size_t len;
     bool   ovf;
+    bool   failure;
 } sb_t;
 
 static void sb_init(sb_t *sb, char *buf, size_t cap)
@@ -62,6 +63,7 @@ static void sb_init(sb_t *sb, char *buf, size_t cap)
     sb->cap = cap;
     sb->len = 0;
     sb->ovf = false;
+    sb->failure = false;
     if (cap > 0) {
         buf[0] = '\0';
     }
@@ -130,6 +132,7 @@ static void resp_null(sb_t *sb, int id)
 
 static void resp_err(sb_t *sb, int id, int status, const char *msg)
 {
+    sb->failure = true;
     sb_printf(sb, "{\"id\":%d,\"status\":%d,\"error\":\"%s\"}", id, status, msg);
 }
 
@@ -372,7 +375,8 @@ static bool parse_swj_bits(const char *line, size_t length, cJSON *args, uint8_t
     return true;
 }
 
-size_t dap_server_process(const char *line, size_t line_len, char *out, size_t out_size)
+size_t dap_server_process(const char *line, size_t line_len, char *out, size_t out_size,
+                          dap_client_t *client)
 {
     sb_t sb;
     sb_init(&sb, out, out_size);
@@ -406,6 +410,20 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
     const char *name = jreq->valuestring;
     int64_t a = 0, b = 0, c = 0, d = 0;
 
+    bool was_held = client->session->held;
+    bool query = !strcmp(name, "hello") || !strcmp(name, "readprop") ||
+                 !strcmp(name, "is_reset_asserted") || !strcmp(name, "has_swo");
+    dap_access_t access = DAP_USE;
+    if (!strcmp(name, "open") || !strcmp(name, "connect")) access = DAP_OPEN;
+    else if (!strcmp(name, "close") || !strcmp(name, "disconnect")) access = DAP_CLOSE;
+    else if (!strcmp(name, "lock")) access = DAP_LOCK;
+    else if (!strcmp(name, "unlock")) access = DAP_UNLOCK;
+    if (!query && !dap_session_access(client, access)) {
+        resp_err(&sb, id, STATUS_PROBE_ERR, "SWD bus is owned by another session");
+        cJSON_Delete(root);
+        return sb.len;
+    }
+
     if (strcmp(name, "hello") == 0) {
         if (!arg_int(args, 0, &a) || a != 1) {
             resp_err(&sb, id, STATUS_GENERAL, "unsupported protocol version");
@@ -423,7 +441,7 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
         probe_connect();
         resp_ok(&sb, id);
     } else if (strcmp(name, "close") == 0) {
-        dap_server_reset_session();
+        dap_server_reset_handles();
         resp_ok(&sb, id);
     } else if (strcmp(name, "lock") == 0 || strcmp(name, "unlock") == 0) {
         resp_ok(&sb, id);
@@ -439,7 +457,6 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
             resp_ok(&sb, id);
         }
     } else if (strcmp(name, "disconnect") == 0) {
-        probe_disconnect();
         resp_ok(&sb, id);
     } else if (strcmp(name, "set_clock") == 0) {
         if (arg_int(args, 0, &a)) {
@@ -465,7 +482,7 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
         if (st == PROBE_OK) {
             resp_ok(&sb, id);
         } else {
-            resp_err(&sb, id, status_of(st), "reset failed");
+            resp_err(&sb, id, status_of(st), "target reset failed; check the nRESET connection");
         }
     } else if (strcmp(name, "assert_reset") == 0) {
         bool asserted = false;
@@ -747,13 +764,8 @@ size_t dap_server_process(const char *line, size_t line_len, char *out, size_t o
         sb_init(&sb, out, out_size);
         resp_err(&sb, id, STATUS_GENERAL, "response too large");
     }
+    if (sb.failure && !was_held && client->used) client->session->held = false;
     return sb.len;
-}
-
-void dap_server_reset_session(void)
-{
-    dap_server_reset_handles();
-    probe_disconnect();
 }
 
 void dap_server_select_session(unsigned session)

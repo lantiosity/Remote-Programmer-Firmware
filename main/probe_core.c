@@ -431,16 +431,13 @@ bool probe_is_reset_asserted(void)
 
 probe_status_t probe_reset_target(void)
 {
-    if (s_probe.cfg.nrst_gpio >= 0) {
-        probe_swd_set_reset(true);
-        vTaskDelay(pdMS_TO_TICKS(20));
-        probe_swd_set_reset(false);
-        vTaskDelay(pdMS_TO_TICKS(20));
-    } else {
-        /* 没有 nRESET 线时用 SYSRESETREQ */
-        (void)probe_dp_write(DP_CTRL_STAT, 0x05FA0004u);
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    /* The probe reset command does not identify a Cortex-M core or its MEM-AP.
+     * A debugger that selected the core can issue SYSRESETREQ through that AP. */
+    if (s_probe.cfg.nrst_gpio < 0) return PROBE_ERR_IO;
+    probe_swd_set_reset(true);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    probe_swd_set_reset(false);
+    vTaskDelay(pdMS_TO_TICKS(20));
     probe_swd_line_reset();
     probe_swd_idle(2);
     s_probe.apsel = 0xFFFFFFFFu;

@@ -36,8 +36,9 @@ esp_err_t cfg_uart_set_baud(int baud);
 
 /** WiFi 凭据（优先返回 NVS 中的值，其次 Kconfig 默认值） */
 bool cfg_wifi_get(char *ssid, size_t ssid_len, char *pass, size_t pass_len);
-esp_err_t cfg_wifi_set(const char *ssid, const char *pass);
-esp_err_t cfg_wifi_clear(void);
+/* Save or clear and schedule a reboot as one operation. */
+esp_err_t cfg_wifi_set(const char *ssid, const char *pass, uint32_t reboot_delay_ms);
+esp_err_t cfg_wifi_clear(uint32_t reboot_delay_ms);
 
 /** 设备标识 */
 const char *cfg_serial_number(void);
@@ -48,7 +49,7 @@ uint16_t cfg_dap_tcp_port(void);
 uint16_t cfg_serial_tcp_port(void);
 
 /** 重启（延时后） */
-void cfg_reboot_later(uint32_t delay_ms);
+esp_err_t cfg_reboot_later(uint32_t delay_ms);
 
 #ifdef __cplusplus
 }

@@ -24,6 +24,7 @@ void usb_dev_hid_send(const uint8_t *data, size_t len);
 /** CDC 虚拟串口端点已就绪即可收发，不要求主机置位 DTR。 */
 bool   usb_dev_cdc_connected(void);
 size_t usb_dev_cdc_read(uint8_t *buf, size_t len);
+/* Nonblocking UART-to-CDC queue; len must fit a serial bridge chunk. */
 void   usb_dev_cdc_write(const uint8_t *data, size_t len);
 bool   usb_dev_cdc_dtr(void);
 bool   usb_dev_cdc_rts(void);

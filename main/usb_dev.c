@@ -23,6 +23,7 @@
 #include "app_cfg.h"
 #include "dap_cmsis.h"
 #include "link.h"
+#include "serial_bridge.h"
 #include "usb_dev.h"
 #include "ble_ota.h"
 
@@ -111,7 +112,9 @@ static atomic_bool s_mounted;
 static atomic_uint s_usb_epoch;
 typedef struct { unsigned epoch; uint8_t data[DAP_PACKET_SIZE]; } hid_packet_t;
 static QueueHandle_t s_hid_tx;
+static QueueHandle_t s_cdc_tx;
 static void hid_tx_deferred(void *unused);
+static void cdc_tx_task(void *unused);
 static atomic_bool s_cdc_dtr;
 static atomic_bool s_cdc_rts;
 
@@ -158,8 +161,8 @@ static void usb_event_cb(tinyusb_event_t *event, void *arg)
     (void)arg;
     switch (event->id) {
     case TINYUSB_EVENT_ATTACHED:
-        s_mounted = true;
         link_session_set(LINK_SINK_USB, (int)atomic_fetch_add(&s_usb_epoch, 1) + 1);
+        s_mounted = true;
         usbd_defer_func(hid_tx_deferred, NULL, false);
         ESP_LOGI(TAG, "USB 已挂载：CMSIS-DAP(HID) + 虚拟串口(CDC)");
         break;
@@ -274,6 +277,14 @@ esp_err_t usb_dev_init(void)
     err = tinyusb_cdcacm_init(&acm_cfg);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "CDC ACM 初始化失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    s_cdc_tx = xQueueCreate(4, sizeof(serial_output_chunk_t));
+    if (!s_cdc_tx) return ESP_ERR_NO_MEM;
+    if (xTaskCreate(cdc_tx_task, "cdc_tx", 3072, NULL, 7, NULL) != pdPASS) {
+        vQueueDelete(s_cdc_tx);
+        s_cdc_tx = NULL;
+        return ESP_ERR_NO_MEM;
     }
 
     ESP_LOGI(TAG, "USB 设备已就绪 (VID:PID = %04X:%04X)",
@@ -313,23 +324,27 @@ size_t usb_dev_cdc_read(uint8_t *buf, size_t len)
 
 void usb_dev_cdc_write(const uint8_t *data, size_t len)
 {
-    if (!usb_dev_cdc_connected() || data == NULL || len == 0) {
-        return;
-    }
-    size_t off = 0;
-    int spin = 0;
-    while (off < len) {
-        size_t n = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, data + off, len - off);
-        off += n;
-        (void)tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(20));
-        if (off < len) {
-            if (++spin > 50) {          /* 约 1s 还写不进去，放弃剩余数据 */
-                break;
-            }
-            vTaskDelay(1);
-        } else {
-            spin = 0;
+    unsigned epoch = atomic_load(&s_usb_epoch);
+    if (!s_cdc_tx || !usb_dev_cdc_connected() || !data || !len || len > SERIAL_BRIDGE_CHUNK_SIZE) return;
+    serial_output_chunk_t chunk = {.token = (int)epoch, .len = len};
+    memcpy(chunk.data, data, len);
+    if (xQueueSend(s_cdc_tx, &chunk, 0) != pdTRUE) serial_bridge_note_drop(SERIAL_OUTPUT_USB, len);
+}
+
+static void cdc_tx_task(void *unused)
+{
+    (void)unused;
+    serial_output_chunk_t chunk;
+    for (;;) {
+        if (xQueueReceive(s_cdc_tx, &chunk, portMAX_DELAY) != pdTRUE) continue;
+        size_t off = 0;
+        for (unsigned attempt = 0; off < chunk.len && attempt < 50; ++attempt) {
+            if (!usb_dev_cdc_connected() || (unsigned)chunk.token != atomic_load(&s_usb_epoch)) break;
+            off += tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, chunk.data + off, chunk.len - off);
+            (void)tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, pdMS_TO_TICKS(20));
+            if (off < chunk.len) vTaskDelay(1);
         }
+        if (off < chunk.len) serial_bridge_note_drop(SERIAL_OUTPUT_USB, chunk.len - off);
     }
 }
 

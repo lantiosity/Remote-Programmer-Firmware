@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -35,6 +36,9 @@ static link_stats_t     s_stats;
 static bool             s_started;
 static portMUX_TYPE s_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static int s_sessions[LINK_SINK_COUNT] = {-1, -1, -1};
+static int s_seen[LINK_SINK_COUNT] = {-1, -1, -1};
+/* The DAP worker changes ownership under probe_lock; the console reads it there. */
+static dap_session_t s_swd;
 
 void link_session_set(link_sink_t sink, int token)
 {
@@ -58,63 +62,83 @@ void link_register_sender(link_sink_t sink, link_send_fn_t fn)
     }
 }
 
+bool link_swd_session_active(void)
+{
+    return s_swd.held;
+}
+
+static void reset_remote_handles(link_sink_t sink)
+{
+    dap_server_select_session((unsigned)(sink - LINK_SINK_TCP));
+    dap_server_reset_handles();
+}
+
+static void release_swd(bool reset_handles)
+{
+    probe_assert_reset(false);
+    probe_disconnect();
+    if (s_swd.sink == LINK_SINK_USB) {
+        dap_cmsis_reset_session();
+    } else if (reset_handles) {
+        reset_remote_handles(s_swd.sink);
+    }
+    s_swd = (dap_session_t){0};
+}
+
+static void process_request(const link_req_t *req)
+{
+    static char json_resp[DAP_JSON_BUF];
+    int sessions[LINK_SINK_COUNT];
+    probe_lock();
+    session_snapshot(sessions);
+    for (link_sink_t sink = LINK_SINK_TCP; sink < LINK_SINK_COUNT; ++sink) {
+        if (s_seen[sink] == sessions[sink]) continue;
+        reset_remote_handles(sink);
+        s_seen[sink] = sessions[sink];
+    }
+    if (dap_session_expired(&s_swd, sessions[s_swd.sink], esp_timer_get_time())) release_swd(true);
+    if (!req || sessions[req->sink] != req->opaque || !s_senders[req->sink]) {
+        probe_unlock();
+        return;
+    }
+
+    dap_client_t client = {.session = &s_swd, .sink = req->sink, .token = req->opaque};
+    bool was_held = s_swd.held;
+    uint8_t usb_resp[DAP_PACKET_SIZE];
+    uint8_t *resp = (uint8_t *)json_resp;
+    size_t n;
+    if (req->sink == LINK_SINK_USB) {
+        /* Vendor OTA/config waits are unrelated to the SWD bus. */
+        bool vendor = req->data[0] == 0x80;
+        if (vendor) probe_unlock();
+        n = dap_cmsis_process(req->data, (uint32_t)req->len, usb_resp, sizeof(usb_resp), &client);
+        if (vendor) probe_lock();
+        resp = usb_resp;
+    } else {
+        dap_server_select_session((unsigned)(req->sink - LINK_SINK_TCP));
+        n = dap_server_process((const char *)req->data, req->len, json_resp, sizeof(json_resp), &client);
+    }
+    if (client.used) {
+        if (s_swd.held) s_swd.last_activity = esp_timer_get_time();
+        else if (was_held) release_swd(false);
+    }
+    probe_unlock();
+
+    if (n && !s_senders[req->sink](req->opaque, resp, n)) {
+        ESP_LOGW(TAG, "send failed on sink %d", (int)req->sink);
+        probe_lock();
+        if (s_swd.held && s_swd.sink == req->sink && s_swd.token == req->opaque) release_swd(true);
+        probe_unlock();
+    }
+}
+
 static void link_worker(void *arg)
 {
-    static char s_json_resp[DAP_JSON_BUF];
     (void)arg;
-    int seen[LINK_SINK_COUNT] = {-1, -1, -1};
-    int owner = -1;
-
     for (;;) {
         link_req_t *req = NULL;
         (void)xQueueReceive(s_queue, &req, pdMS_TO_TICKS(100));
-        int sessions[LINK_SINK_COUNT];
-        session_snapshot(sessions);
-        probe_lock();
-        for (int sink = LINK_SINK_USB; sink < LINK_SINK_COUNT; ++sink) {
-            if (seen[sink] == sessions[sink]) continue;
-            if (sink != LINK_SINK_USB) {
-                dap_server_select_session((unsigned)(sink - LINK_SINK_TCP));
-                dap_server_reset_handles();
-            }
-            if (owner == sink) { probe_disconnect(); owner = -1; }
-            seen[sink] = sessions[sink];
-        }
-        probe_unlock();
-        if (!req) continue;
-        if (sessions[req->sink] != req->opaque) {
-            free(req);
-            continue;
-        }
-        link_send_fn_t send = s_senders[req->sink];
-        if (send == NULL) {
-            ESP_LOGW(TAG, "sink %d 没有注册发送函数，丢弃请求", (int)req->sink);
-        }
-        if (send != NULL) {
-            if (req->sink == LINK_SINK_USB) {
-                uint8_t resp[DAP_PACKET_SIZE];
-                /* Vendor OTA/config waits are unrelated to the SWD bus. */
-                bool uses_probe = req->data[0] != 0x80;
-                if (uses_probe) { probe_lock(); owner = LINK_SINK_USB; }
-                uint32_t n = dap_cmsis_process(req->data, (uint32_t)req->len, resp, sizeof(resp));
-                if (uses_probe) probe_unlock();
-                if (n > 0) {
-                    send(req->opaque, resp, n);
-                }
-            } else {
-                probe_lock();
-                owner = req->sink;
-                dap_server_select_session((unsigned)(req->sink - LINK_SINK_TCP));
-                size_t n = dap_server_process((const char *)req->data, req->len,
-                                              s_json_resp, sizeof(s_json_resp));
-                probe_unlock();
-                if (n > 0) {
-                    if (!send(req->opaque, (const uint8_t *)s_json_resp, n)) {
-                        ESP_LOGW(TAG, "send failed on sink %d", (int)req->sink);
-                    }
-                }
-            }
-        }
+        process_request(req);
         free(req);
     }
 }
@@ -141,7 +165,7 @@ esp_err_t link_init(void)
 
 esp_err_t link_submit(link_sink_t sink, int opaque, const uint8_t *data, size_t len)
 {
-    if (!s_started || data == NULL || len == 0 || sink < 0 || sink >= LINK_SINK_COUNT ||
+    if (!s_started || data == NULL || len == 0 || opaque < 0 || sink < 0 || sink >= LINK_SINK_COUNT ||
         len > (sink == LINK_SINK_USB ? DAP_PACKET_SIZE : DAP_JSON_BUF - 1)) {
         return ESP_ERR_INVALID_ARG;
     }
