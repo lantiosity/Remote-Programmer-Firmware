@@ -143,4 +143,30 @@ menu "ESP-SWD DAPLink 配置"
 
     endmenu
 
+    menu "6. 本地面板与 microSD"
+
+        config FRONT_PANEL_ENABLED
+            bool "启用 ST7789、六键和 1-bit SDMMC"
+            default y
+            help
+                使用本板固定引脚表。若自定义 SWD/UART/OTA 引脚与面板共用，
+                固件会跳过面板初始化。
+
+        if FRONT_PANEL_ENABLED
+            config FRONT_LCD_CLOCK_MHZ
+                int "ST7789 SPI3 时钟 (MHz)"
+                range 1 40
+                default 20
+
+            config FRONT_LCD_INVERT
+                bool "ST7789 显示反色模式"
+                default y
+
+            config FRONT_LCD_BL_ACTIVE_LOW
+                bool "LCD 背光控制低有效"
+                default n
+        endif
+
+    endmenu
+
 endmenu

@@ -18,6 +18,8 @@ idf_component_register(
         "serial_bridge.c"
         "swd_emu.c"
         "console_cmds.c"
+        "front_panel.c"
+        "front_panel_lcd.c"
     INCLUDE_DIRS "include"
     REQUIRES
         espressif__esp_tinyusb
@@ -37,4 +39,9 @@ idf_component_register(
         mbedtls
         espressif__cjson
         console
+    PRIV_REQUIRES
+        esp_lcd
+        esp_driver_sdmmc
+        fatfs
+        sdmmc
 )

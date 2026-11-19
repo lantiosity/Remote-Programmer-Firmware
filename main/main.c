@@ -24,6 +24,7 @@
 #include "ble_ota.h"
 #include "wifi_setup.h"
 #include "console_cmds.h"
+#include "front_panel.h"
 #include "link.h"
 #include "net_dev.h"
 #include "probe_core.h"
@@ -102,6 +103,7 @@ void app_main(void)
     healthy = healthy && ble_dev_ready();
 #endif
     ble_ota_boot_confirm(healthy);
+    front_panel_start();
 
     ESP_LOGI(TAG, "初始化完成，等待上位机连接");
     ESP_LOGI(TAG, "USB: 产品名应显示为 \"CMSIS-DAP\" 并出现一个虚拟串口");
