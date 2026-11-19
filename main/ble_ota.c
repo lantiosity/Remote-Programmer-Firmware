@@ -20,6 +20,7 @@
 #include "app_cfg.h"
 #include "ble_ota.h"
 #include "net_dev.h"
+#include "web_config.h"
 #include "ota_policy.h"
 
 enum { IDLE, ARMED, PREPARING, RECEIVING, VERIFYING, READY, REBOOTING, ERROR };
@@ -488,6 +489,7 @@ static void worker(void *arg)
             if (!button_since) button_since = now;
             if (!button_fired && now - button_since >= 2000000) {
                 (void)ble_ota_arm(300);
+                (void)web_config_arm();
                 button_fired = true;
             }
         } else { button_since = 0; button_fired = false; }

@@ -19,6 +19,7 @@
 #include "app_cfg.h"
 #include "front_panel_lcd.h"
 #include "front_panel_pins.h"
+#include "web_config.h"
 
 enum { UP, DOWN, LEFT, RIGHT, OK, BACK, KEY_COUNT };
 enum { ENTRY_LIMIT = 16, VISIBLE_ENTRIES = 8, DEBOUNCE_SAMPLES = 3 };
@@ -43,12 +44,14 @@ static char s_entries[ENTRY_LIMIT][PANEL_COLS - 1];
 static unsigned s_count, s_selected;
 static bool s_more_entries, s_directory_error, s_key_page, s_lcd_ready;
 static panel_key_t s_keys[KEY_COUNT];
+static char s_web_code[WEB_CONFIG_CODE_LEN + 1];
 
 static void draw(void)
 {
     if (!s_lcd_ready) return;
     panel_lines_t lines = {0};
     snprintf(lines[0], sizeof(lines[0]), "ESP-SWD %.10s", esp_app_get_description()->version);
+    if (s_web_code[0]) snprintf(lines[1], sizeof(lines[1]), "WEB: %s", s_web_code);
     if (s_key_page) {
         strcpy(lines[2], "KEY PRESS COUNTS");
         for (unsigned i = 0; i < KEY_COUNT; ++i) {
@@ -182,7 +185,10 @@ static void front_panel_task(void *arg)
     mount_card();
     draw();
     for (;;) {
-        bool dirty = false;
+        char web_code[WEB_CONFIG_CODE_LEN + 1];
+        web_config_get_code(web_code);
+        bool dirty = strcmp(s_web_code, web_code) != 0;
+        if (dirty) strcpy(s_web_code, web_code);
         for (unsigned i = 0; i < KEY_COUNT; ++i) {
             panel_key_t *key = &s_keys[i];
             const bool pressed = gpio_get_level(key_pins[i]) == 0;

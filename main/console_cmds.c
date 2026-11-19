@@ -20,6 +20,7 @@
 #include "ble_dev.h"
 #include "ble_ota.h"
 #include "wifi_setup.h"
+#include "web_config.h"
 #include "console_cmds.h"
 #include "link.h"
 #include "net_dev.h"
@@ -86,6 +87,35 @@ static int cmd_ota(int argc, char **argv)
     ble_ota_info(info, sizeof(info));
     printf("OTA state=%u armed=%u busy=%u\n%s\n", status[1], status[3]&1,
            (status[3]>>1)&1, info);
+    return 0;
+}
+
+static int cmd_webcfg(int argc, char **argv)
+{
+    if (argc != 2) {
+        puts("Usage: webcfg arm|status|off");
+        return 1;
+    }
+    if (strcmp(argv[1], "off") == 0) {
+        web_config_close();
+        puts("Web configuration locked");
+        return 0;
+    }
+    if (strcmp(argv[1], "arm") == 0) {
+        if (!web_config_arm()) {
+            puts("Web configuration server unavailable");
+            return 1;
+        }
+    } else if (strcmp(argv[1], "status") != 0) {
+        puts("Usage: webcfg arm|status|off");
+        return 1;
+    }
+    char code[WEB_CONFIG_CODE_LEN + 1];
+    if (web_config_get_code(code)) {
+        printf("Web setup code: %s (window: 5 min), http://%s/\n", code, net_dev_ip());
+    } else {
+        puts("Web configuration locked");
+    }
     return 0;
 }
 
@@ -768,6 +798,7 @@ static const esp_console_cmd_t s_cmds[] = {
     {.command = "selftest", .help = "selftest <APSEL> [scratch RAM] AP IDR and optional RAM loopback", .func = cmd_selftest_l},
     {.command = "status", .help = "显示 USB/WiFi/BLE/SWD 状态", .func = cmd_status},
     {.command = "ota", .help = "ota status|arm [seconds] [usb|wifi|ble|all]|off ESP32 USB/WiFi/BLE 自身固件升级", .func = cmd_ota},
+    {.command = "webcfg", .help = "webcfg arm|status|off 管理网页配置授权", .func = cmd_webcfg},
     {.command = "wifi", .help = "wifi <ssid> <pass> 设置 | wifi -c 清除 | wifi 查看", .func = cmd_wifi},
     {.command = "wifihex", .help = "wifihex <SSID十六进制> [密码]（支持中文 SSID）", .func = cmd_wifihex},
     {.command = "swd", .help = "swd [kHz] 设置 SWD 时钟", .func = cmd_swd_l},
