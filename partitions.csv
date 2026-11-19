@@ -1,5 +1,5 @@
 # 16 MiB Flash. NVS/PHY/factory base retained; migrate this layout via ROM USB/UART.
-# offline is reserved raw storage, never an OTA destination; no filesystem yet.
+# offline stores target images for standalone SWD flashing; it is never an OTA destination.
 # Name,   Type, SubType, Offset,   Size,      Flags
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,

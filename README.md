@@ -26,7 +26,7 @@ python -m esptool --chip esp32s3 --port COM22 --before no-reset --after hard-res
 | `esp_swdlink.bin` | `0x10000` | factory 应用；也用于日常 OTA |
 | `ota_data_initial.bin` | `0x310000` | 初始化 OTA 选择，启动 factory |
 
-完整安装会覆盖 factory 和 OTA 选择数据，重新从 factory 启动；命令按地址分别写入，不擦除 NVS、PHY 和 offline 预留区。已有设备应先备份重要数据，且不要启用全片擦除。factory 为 3 MiB，两个 OTA 槽各 4 MiB，offline 保留 4.875 MiB，后者尚未实现离线烧录功能。分区变化必须走完整安装，不能只传应用 OTA。
+完整安装会覆盖 factory 和 OTA 选择数据，重新从 factory 启动；命令按地址分别写入，不擦除 NVS、PHY 和 offline 区。已有设备应先备份重要数据，且不要启用全片擦除。factory 为 3 MiB，两个 OTA 槽各 4 MiB，offline 为 4.875 MiB，供离线烧录保存目标镜像。分区变化必须走完整安装，不能只传应用 OTA。
 
 日常 USB/WiFi/BLE OTA 只选择 [`esp_swdlink.bin`](release/0.1.3/images/esp_swdlink.bin)。升级步骤、镜像清单及校验方式见 [OTA 操作说明](docs/OTA.md)和[烧录说明](release/0.1.3/images/README.md)。
 
@@ -55,7 +55,7 @@ WiFi 凭据通过运行时配网保存到设备 NVS，不提交到源码。默�
 
 ## 运行行为与验证
 
-开发版支持写入型 SPI3 ST7789 240×320、独立 1-bit SDMMC 与六个按键。LCD 和 SDMMC 均使用 DMA。详见[面板接线与操作](docs/FRONT_PANEL.md)。
+开发版支持 SPI3 ST7789 240×320、独立 1-bit SDMMC 与六个按键。中文面板支持从 microSD 或板载存储选择 `.bin`，离线烧录 STM32H743VI。LCD 和 SDMMC 均使用 DMA。详见[面板接线与操作](docs/FRONT_PANEL.md)。
 
 开发版网页支持 STM32H743VI 烧录、目标串口监视、ESP-SWD OTA 和 Wi-Fi 配置。连接设备热点后打开 `http://192.168.4.1/`，或在同一局域网打开设备当前 IPv4 地址。操作前长按 BOOT 约 2 秒读取 LCD 配置码，或在 UART 控制台运行 `webcfg arm`。详见[固件网页使用说明](docs/WEB_CONFIG.md)。
 

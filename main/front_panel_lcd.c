@@ -14,57 +14,11 @@
 #include "front_panel_lcd.h"
 #include "front_panel_pins.h"
 
-enum { LCD_WIDTH = 240, ROW_HEIGHT = 16, GLYPH_ADVANCE = 12 };
-enum { COLOR_BG = 0x10a3, COLOR_TEXT = 0xffff, COLOR_TITLE = 0x07ff };
-
-_Static_assert(PANEL_ROWS * ROW_HEIGHT == 320, "LCD rows must cover the full display");
-_Static_assert(PANEL_COLS * GLYPH_ADVANCE + 6 <= LCD_WIDTH, "LCD text must fit the DMA strip");
-
-/* 5x7 glyphs, one bit column per byte, least significant bit at the top. */
-static const uint8_t letters[26][5] = {
-    {0x7e,0x11,0x11,0x11,0x7e}, {0x7f,0x49,0x49,0x49,0x36},
-    {0x3e,0x41,0x41,0x41,0x22}, {0x7f,0x41,0x41,0x22,0x1c},
-    {0x7f,0x49,0x49,0x49,0x41}, {0x7f,0x09,0x09,0x09,0x01},
-    {0x3e,0x41,0x49,0x49,0x7a}, {0x7f,0x08,0x08,0x08,0x7f},
-    {0x00,0x41,0x7f,0x41,0x00}, {0x20,0x40,0x41,0x3f,0x01},
-    {0x7f,0x08,0x14,0x22,0x41}, {0x7f,0x40,0x40,0x40,0x40},
-    {0x7f,0x02,0x0c,0x02,0x7f}, {0x7f,0x04,0x08,0x10,0x7f},
-    {0x3e,0x41,0x41,0x41,0x3e}, {0x7f,0x09,0x09,0x09,0x06},
-    {0x3e,0x41,0x51,0x21,0x5e}, {0x7f,0x09,0x19,0x29,0x46},
-    {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7f,0x01,0x01},
-    {0x3f,0x40,0x40,0x40,0x3f}, {0x1f,0x20,0x40,0x20,0x1f},
-    {0x7f,0x20,0x18,0x20,0x7f}, {0x63,0x14,0x08,0x14,0x63},
-    {0x03,0x04,0x78,0x04,0x03}, {0x61,0x51,0x49,0x45,0x43},
-};
-static const uint8_t digits[10][5] = {
-    {0x3e,0x51,0x49,0x45,0x3e}, {0x00,0x42,0x7f,0x40,0x00},
-    {0x42,0x61,0x51,0x49,0x46}, {0x21,0x41,0x45,0x4b,0x31},
-    {0x18,0x14,0x12,0x7f,0x10}, {0x27,0x45,0x45,0x45,0x39},
-    {0x3c,0x4a,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03},
-    {0x36,0x49,0x49,0x49,0x36}, {0x06,0x49,0x49,0x29,0x1e},
-};
-
-static uint8_t glyph(char ch, unsigned col)
-{
-    if (ch >= 'a' && ch <= 'z') ch -= 'a' - 'A';
-    if (ch >= 'A' && ch <= 'Z') return letters[ch - 'A'][col];
-    if (ch >= '0' && ch <= '9') return digits[ch - '0'][col];
-    switch (ch) {
-    case ' ': return 0;
-    case '.': return col == 2 ? 0x40 : 0;
-    case ':': return col == 2 ? 0x24 : 0;
-    case '-': return 0x08;
-    case '_': return 0x40;
-    case '/': return 0x40 >> col;
-    case '>': return ((const uint8_t[]){0,0x22,0x14,0x08,0})[col];
-    default: return ((const uint8_t[]){0x02,0x01,0x51,0x09,0x06})[col];
-    }
-}
-
 static esp_lcd_panel_handle_t s_panel;
 static SemaphoreHandle_t s_dma_done;
 static uint16_t *s_pixels;
-static panel_lines_t s_displayed;
+static uint16_t *s_displayed;
+extern const uint8_t panel_font[] asm("_binary_panel_font_bin_start");
 static uint32_t s_drawn_rows;
 
 static bool lcd_dma_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *event, void *ctx)
@@ -91,9 +45,11 @@ esp_err_t front_panel_lcd_init(void)
 #endif
     gpio_set_level(LCD_BL, !bl_on);
     s_dma_done = xSemaphoreCreateBinary();
-    s_pixels = heap_caps_malloc(LCD_WIDTH * ROW_HEIGHT * sizeof(*s_pixels),
+    s_pixels = heap_caps_malloc(PANEL_WIDTH * PANEL_STRIP * sizeof(*s_pixels),
                                 MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (!s_dma_done || !s_pixels) {
+    s_displayed = heap_caps_malloc(PANEL_WIDTH * PANEL_HEIGHT * sizeof(*s_displayed),
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_dma_done || !s_pixels || !s_displayed) {
         err = ESP_ERR_NO_MEM;
         goto free_buffers;
     }
@@ -108,7 +64,7 @@ esp_err_t front_panel_lcd_init(void)
         .data5_io_num = -1,
         .data6_io_num = -1,
         .data7_io_num = -1,
-        .max_transfer_sz = LCD_WIDTH * ROW_HEIGHT * sizeof(*s_pixels),
+        .max_transfer_sz = PANEL_WIDTH * PANEL_STRIP * sizeof(*s_pixels),
     };
     err = spi_bus_initialize(SPI3_HOST, &bus, SPI_DMA_CH_AUTO);
     if (err != ESP_OK) goto free_buffers;
@@ -150,37 +106,28 @@ free_io:
 free_bus:
     spi_bus_free(SPI3_HOST);
 free_buffers:
+    heap_caps_free(s_displayed);
     heap_caps_free(s_pixels);
     if (s_dma_done) vSemaphoreDelete(s_dma_done);
     return err;
 }
 
-esp_err_t front_panel_lcd_show(const panel_lines_t lines)
+esp_err_t front_panel_lcd_show(const panel_scene_t *scene)
 {
-    for (unsigned row = 0; row < PANEL_ROWS; ++row) {
-        if ((s_drawn_rows & (1u << row)) && strcmp(lines[row], s_displayed[row]) == 0) continue;
-        const uint16_t bg = __builtin_bswap16(COLOR_BG);
-        const uint16_t fg = __builtin_bswap16(row == 0 || lines[row][0] == '>' ? COLOR_TITLE : COLOR_TEXT);
-        for (unsigned i = 0; i < LCD_WIDTH * ROW_HEIGHT; ++i) s_pixels[i] = bg;
-        for (unsigned i = 0; i < PANEL_COLS && lines[row][i]; ++i) {
-            for (unsigned col = 0; col < 5; ++col) {
-                const uint8_t bits = glyph(lines[row][i], col);
-                const unsigned x = 6 + GLYPH_ADVANCE * i + 2 * col;
-                for (unsigned y = 0; y < 7; ++y) {
-                    if (!(bits & (1u << y))) continue;
-                    uint16_t *p = &s_pixels[(2 * y + 1) * LCD_WIDTH + x];
-                    p[0] = p[1] = p[LCD_WIDTH] = p[LCD_WIDTH + 1] = fg;
-                }
-            }
-        }
-        esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, row * ROW_HEIGHT,
-                                                  LCD_WIDTH, (row + 1) * ROW_HEIGHT, s_pixels);
+    const size_t count = PANEL_WIDTH * PANEL_STRIP;
+    for (unsigned y = 0; y < PANEL_HEIGHT; y += PANEL_STRIP) {
+        const uint32_t strip = 1u << (y / PANEL_STRIP);
+        uint16_t *previous = s_displayed + y * PANEL_WIDTH;
+        panel_render_strip(scene, y, s_pixels, panel_font);
+        if ((s_drawn_rows & strip) && memcmp(previous, s_pixels, count * sizeof(*s_pixels)) == 0)
+            continue;
+        memcpy(previous, s_pixels, count * sizeof(*s_pixels));
+        for (unsigned i = 0; i < count; ++i) s_pixels[i] = __builtin_bswap16(s_pixels[i]);
+        esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, 0, y, PANEL_WIDTH, y + PANEL_STRIP, s_pixels);
         if (err != ESP_OK) return err;
-        /* If the callback times out the caller stops drawing and leaves the
-         * buffer owned by the driver, so an in-flight DMA never sees freed RAM. */
+        /* Leave the buffer owned by the driver if the callback times out. */
         if (xSemaphoreTake(s_dma_done, pdMS_TO_TICKS(250)) != pdTRUE) return ESP_ERR_TIMEOUT;
-        memcpy(s_displayed[row], lines[row], sizeof(s_displayed[row]));
-        s_drawn_rows |= 1u << row;
+        s_drawn_rows |= strip;
     }
     return ESP_OK;
 }

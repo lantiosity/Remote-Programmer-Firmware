@@ -20,12 +20,14 @@ idf_component_register(
         "console_cmds.c"
         "front_panel.c"
         "front_panel_lcd.c"
+        "front_panel_view.c"
+        "panel_scene.c"
         "web_config.c"
         "device_jobs.c"
         "offline_image.c"
         "target_flash_h743.c"
     INCLUDE_DIRS "include"
-    EMBED_FILES "web_config.html"
+    EMBED_FILES "web_config.html" "panel_assets/panel_font.bin"
     REQUIRES
         espressif__esp_tinyusb
         driver
