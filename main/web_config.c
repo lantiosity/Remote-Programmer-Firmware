@@ -21,7 +21,7 @@
 #include "serial_bridge.h"
 #include "target_flash_h743.h"
 #include "web_config.h"
-#include "web_jobs.h"
+#include "device_jobs.h"
 #include "wifi_setup.h"
 
 static const char *TAG = "web_config";
@@ -290,7 +290,7 @@ static esp_err_t wifi_scan(httpd_req_t *req)
     if (req->method == HTTP_POST) {
         if (req->content_len)
             return upload_error(req, HTTPD_400_BAD_REQUEST, "Expected an empty request");
-        if (web_job_status().active || ble_ota_in_progress()) return upload_conflict(req);
+        if (device_job_status().active || ble_ota_in_progress()) return upload_conflict(req);
         uint32_t id;
         esp_err_t err = wifi_setup_web_scan_start(&id);
         if (err == ESP_ERR_INVALID_STATE) return upload_conflict(req);
@@ -344,7 +344,7 @@ static esp_err_t upload(httpd_req_t *req)
     response_headers(req);
     if (!local_request(req) || !authorized(req))
         return upload_error(req, HTTPD_403_FORBIDDEN, "Setup code missing, invalid or expired");
-    if (web_job_status().active || ble_ota_in_progress()) return upload_conflict(req);
+    if (device_job_status().active || ble_ota_in_progress()) return upload_conflict(req);
     char type[32];
     if (httpd_req_get_hdr_value_str(req, "Content-Type", type, sizeof(type)) != ESP_OK ||
         strcmp(type, "application/octet-stream"))
@@ -388,7 +388,7 @@ static esp_err_t upload(httpd_req_t *req)
     }
 
     uint32_t id;
-    esp_err_t err = web_job_start(ota ? WEB_JOB_OTA : WEB_JOB_FLASH, address, reset_run, image, size, &id);
+    esp_err_t err = device_job_start(ota ? DEVICE_JOB_OTA : DEVICE_JOB_FLASH, address, reset_run, image, size, &id);
     if (err != ESP_OK) {
         free(image);
         if (err == ESP_ERR_INVALID_STATE) return upload_conflict(req);
@@ -405,8 +405,8 @@ static esp_err_t job_status(httpd_req_t *req)
 {
     response_headers(req);
     if (!local_request(req)) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, NULL);
-    web_job_status_t job = web_job_status();
-    const char *kind = job.kind == WEB_JOB_FLASH ? "flash" : job.kind == WEB_JOB_OTA ? "ota" : "";
+    device_job_status_t job = device_job_status();
+    const char *kind = job.kind == DEVICE_JOB_FLASH ? "flash" : job.kind == DEVICE_JOB_OTA ? "ota" : "";
     char body[224];
     snprintf(body, sizeof(body),
         "{\"id\":%" PRIu32 ",\"kind\":\"%s\",\"phase\":\"%s\",\"done\":%zu,\"total\":%zu,"
