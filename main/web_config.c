@@ -1,18 +1,27 @@
+#include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
 #include "esp_app_desc.h"
+#include "esp_app_format.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "mbedtls/platform_util.h"
 
 #include "app_cfg.h"
+#include "ble_ota.h"
 #include "net_dev.h"
+#include "serial_bridge.h"
+#include "target_flash_h743.h"
 #include "web_config.h"
+#include "web_jobs.h"
 
 static const char *TAG = "web_config";
 static const char HEX[] = "0123456789ABCDEF";
@@ -21,6 +30,11 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_ready;
 static int64_t s_expires;
 static char s_code[WEB_CONFIG_CODE_LEN + 1];
+
+#define SERIAL_CAPACITY 8192u
+static portMUX_TYPE s_serial_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t *s_serial;
+static uint32_t s_serial_end, s_serial_used;
 
 extern const char page_start[] asm("_binary_web_config_html_start");
 extern const char page_end[] asm("_binary_web_config_html_end");
@@ -237,10 +251,190 @@ static esp_err_t change_wifi(httpd_req_t *req)
     return ESP_FAIL;
 }
 
+static bool read_u32_header(httpd_req_t *req, const char *name, uint32_t *value)
+{
+    char raw[11];
+    if (httpd_req_get_hdr_value_str(req, name, raw, sizeof(raw)) != ESP_OK || !raw[0])
+        return false;
+    uint64_t number = 0;
+    for (const char *p = raw; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        number = number * 10 + (unsigned)(*p - '0');
+    }
+    if (number > UINT32_MAX) return false;
+    *value = (uint32_t)number;
+    return true;
+}
+
+static esp_err_t upload_error(httpd_req_t *req, httpd_err_code_t code, const char *reason)
+{
+    httpd_resp_send_err(req, code, reason);
+    return ESP_FAIL; /* Close the socket if a rejected request still has an unread body. */
+}
+
+static esp_err_t upload_conflict(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_sendstr(req, "Device is busy");
+    return ESP_FAIL;
+}
+
+static bool ota_header_valid(const uint8_t *image)
+{
+    esp_image_header_t header;
+    esp_app_desc_t desc;
+    memcpy(&header, image, sizeof(header));
+    memcpy(&desc, image + sizeof(header) + sizeof(esp_image_segment_header_t), sizeof(desc));
+    return header.magic == ESP_IMAGE_HEADER_MAGIC && header.chip_id == ESP_CHIP_ID_ESP32S3 &&
+        desc.magic_word == ESP_APP_DESC_MAGIC_WORD &&
+        strncmp(desc.project_name, esp_app_get_description()->project_name, sizeof(desc.project_name)) == 0;
+}
+
+static esp_err_t upload(httpd_req_t *req)
+{
+    response_headers(req);
+    if (!local_request(req) || !authorized(req))
+        return upload_error(req, HTTPD_403_FORBIDDEN, "Setup code missing, invalid or expired");
+    if (web_job_status().active || ble_ota_in_progress()) return upload_conflict(req);
+    char type[32];
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", type, sizeof(type)) != ESP_OK ||
+        strcmp(type, "application/octet-stream"))
+        return upload_error(req, HTTPD_400_BAD_REQUEST, "Expected a binary image");
+
+    const bool ota = req->user_ctx != NULL;
+    const size_t size = req->content_len;
+    uint32_t address = 0, reset_run = 0;
+    if (ota) {
+        const esp_partition_t *slot = esp_ota_get_next_update_partition(NULL);
+        if (!slot || size < sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) +
+            sizeof(esp_app_desc_t) || size > slot->size)
+            return upload_error(req, HTTPD_400_BAD_REQUEST, "Image does not fit the OTA slot");
+    } else {
+        if (!read_u32_header(req, "X-Flash-Address", &address) ||
+            !read_u32_header(req, "X-Reset-Run", &reset_run) || reset_run > 1 ||
+            !target_flash_h743_range(address, size))
+            return upload_error(req, HTTPD_400_BAD_REQUEST, "Invalid target address or image size");
+        if (cfg_probe()->nreset_gpio < 0)
+            return upload_error(req, HTTPD_400_BAD_REQUEST, "Target NRST is required");
+    }
+    uint8_t *image = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!image) return upload_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Image buffer unavailable");
+
+    const int64_t deadline = esp_timer_get_time() + 45000000;
+    size_t received = 0;
+    while (received < size && esp_timer_get_time() < deadline) {
+        size_t count = size - received < 4096 ? size - received : 4096;
+        int n = httpd_req_recv(req, (char *)image + received, count);
+        if (n <= 0) break;
+        received += (size_t)n;
+    }
+    const bool allowed = received == size && authorized(req);
+    if (!allowed || (ota && !ota_header_valid(image))) {
+        free(image);
+        if (received != size)
+            return upload_error(req, HTTPD_408_REQ_TIMEOUT, "Upload incomplete or timed out");
+        if (!allowed)
+            return upload_error(req, HTTPD_403_FORBIDDEN, "Setup code expired");
+        return upload_error(req, HTTPD_400_BAD_REQUEST, "Expected an ESP-SWD OTA app image");
+    }
+
+    uint32_t id;
+    esp_err_t err = web_job_start(ota ? WEB_JOB_OTA : WEB_JOB_FLASH, address, reset_run, image, size, &id);
+    if (err != ESP_OK) {
+        free(image);
+        if (err == ESP_ERR_INVALID_STATE) return upload_conflict(req);
+        return upload_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not start the job");
+    }
+    char body[32];
+    snprintf(body, sizeof(body), "{\"id\":%" PRIu32 "}", id);
+    httpd_resp_set_status(req, "202 Accepted");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t job_status(httpd_req_t *req)
+{
+    response_headers(req);
+    if (!local_request(req)) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, NULL);
+    web_job_status_t job = web_job_status();
+    const char *kind = job.kind == WEB_JOB_FLASH ? "flash" : job.kind == WEB_JOB_OTA ? "ota" : "";
+    char body[224];
+    snprintf(body, sizeof(body),
+        "{\"id\":%" PRIu32 ",\"kind\":\"%s\",\"phase\":\"%s\",\"done\":%zu,\"total\":%zu,"
+        "\"error\":%d,\"error_name\":\"%s\",\"active\":%s}", job.id, kind, job.phase, job.done, job.total,
+        (int)job.error, esp_err_to_name(job.error), job.active ? "true" : "false");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, body);
+}
+
+static esp_err_t ota_info(httpd_req_t *req)
+{
+    response_headers(req);
+    if (!local_request(req)) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, NULL);
+    char body[512];
+    size_t size = ble_ota_info(body, sizeof(body));
+    if (!size) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, NULL);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, body, size);
+}
+
+static bool serial_sink(int opaque, const uint8_t *data, size_t size)
+{
+    (void)opaque;
+    portENTER_CRITICAL(&s_serial_lock);
+    size_t index = s_serial_end % SERIAL_CAPACITY;
+    size_t first = size < SERIAL_CAPACITY - index ? size : SERIAL_CAPACITY - index;
+    memcpy(s_serial + index, data, first);
+    memcpy(s_serial, data + first, size - first);
+    s_serial_end += size;
+    s_serial_used += size;
+    if (s_serial_used > SERIAL_CAPACITY) s_serial_used = SERIAL_CAPACITY;
+    portEXIT_CRITICAL(&s_serial_lock);
+    return true;
+}
+
+static esp_err_t serial_read(httpd_req_t *req)
+{
+    response_headers(req);
+    if (!local_request(req) || !authorized(req))
+        return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Setup code missing, invalid or expired");
+    if (!s_serial) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "UART unavailable");
+    uint32_t cursor;
+    bool first_read = !httpd_req_get_hdr_value_len(req, "X-Serial-Cursor");
+    if (!first_read && !read_u32_header(req, "X-Serial-Cursor", &cursor))
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid serial cursor");
+
+    char data[2048], next[11], missed[11], baud[12];
+    portENTER_CRITICAL(&s_serial_lock);
+    if (first_read) cursor = s_serial_end - s_serial_used;
+    uint32_t count = s_serial_end - cursor;
+    /* A cursor ahead of the writer is stale (for example after a reboot). */
+    if (count > INT32_MAX) count = s_serial_used;
+    uint32_t dropped = count > s_serial_used ? count - s_serial_used : 0;
+    cursor = s_serial_end - (count - dropped);
+    count -= dropped;
+    if (count > sizeof(data)) count = sizeof(data);
+    size_t index = cursor % SERIAL_CAPACITY;
+    size_t first = count < SERIAL_CAPACITY - index ? count : SERIAL_CAPACITY - index;
+    memcpy(data, s_serial + index, first);
+    memcpy(data + first, s_serial, count - first);
+    portEXIT_CRITICAL(&s_serial_lock);
+
+    snprintf(next, sizeof(next), "%" PRIu32, cursor + count);
+    snprintf(missed, sizeof(missed), "%" PRIu32, dropped);
+    snprintf(baud, sizeof(baud), "%d", serial_bridge_get_baud());
+    httpd_resp_set_hdr(req, "X-Serial-Next", next);
+    httpd_resp_set_hdr(req, "X-Serial-Dropped", missed);
+    httpd_resp_set_hdr(req, "X-Serial-Baud", baud);
+    httpd_resp_set_type(req, "application/octet-stream");
+    return httpd_resp_send(req, data, count);
+}
+
 esp_err_t web_config_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = 3;
+    config.max_uri_handlers = 9;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 3;
     config.send_wait_timeout = 3;
@@ -253,6 +447,11 @@ esp_err_t web_config_start(void)
         {.uri = "/api/status", .method = HTTP_GET, .handler = status},
         {.uri = "/api/wifi", .method = HTTP_POST, .handler = change_wifi},
         {.uri = "/api/wifi/clear", .method = HTTP_POST, .handler = change_wifi, .user_ctx = (void *)1},
+        {.uri = "/api/flash", .method = HTTP_POST, .handler = upload},
+        {.uri = "/api/ota", .method = HTTP_POST, .handler = upload, .user_ctx = (void *)1},
+        {.uri = "/api/job", .method = HTTP_GET, .handler = job_status},
+        {.uri = "/api/ota-info", .method = HTTP_GET, .handler = ota_info},
+        {.uri = "/api/serial", .method = HTTP_GET, .handler = serial_read},
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); ++i) {
         err = httpd_register_uri_handler(server, &routes[i]);
@@ -260,6 +459,12 @@ esp_err_t web_config_start(void)
             httpd_stop(server);
             return err;
         }
+    }
+    s_serial = heap_caps_malloc(SERIAL_CAPACITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_serial || serial_bridge_subscribe(serial_sink, 0) != ESP_OK) {
+        free(s_serial);
+        s_serial = NULL;
+        ESP_LOGW(TAG, "Web serial monitor unavailable");
     }
     portENTER_CRITICAL(&s_lock);
     s_ready = true;
