@@ -1,4 +1,4 @@
-/* Shared BLE / USB / WiFi self-update. Flash operations run in a worker, never in NimBLE callbacks.
+/* Shared BLE / USB / WiFi / web self-update. Flash operations run in a worker.
  * Protocol v1: control BEGIN(1,size32,sha256), FINISH(3), ACTIVATE(4), ABORT(5).
  * Data: offset32 + up to 480 bytes. All integers are little-endian.
  */
@@ -25,6 +25,7 @@
 
 enum { IDLE, ARMED, PREPARING, RECEIVING, VERIFYING, READY, REBOOTING, ERROR };
 enum { BEGIN = 1, DATA, FINISH, ACTIVATE, ABORT };
+#define OTA_OWNER_WEB 0xFFFCu
 enum { ERR_PROTOCOL = 0x7001, ERR_LOCKED, ERR_OFFSET, ERR_HASH,
        ERR_TIMEOUT, ERR_DISCONNECTED, ERR_SIZE, ERR_PROJECT };
 typedef struct {
@@ -71,6 +72,7 @@ static void put32(uint8_t *p, uint32_t v)
 
 static unsigned owner_transport(uint16_t owner)
 {
+    if (owner == OTA_OWNER_WEB) return 0;
     return owner == OTA_OWNER_USB ? OTA_ALLOW_USB :
         owner == OTA_OWNER_WIFI ? OTA_ALLOW_WIFI : OTA_ALLOW_BLE;
 }
@@ -167,7 +169,7 @@ static void notify_worker(struct ble_npl_event *event)
     portENTER_CRITICAL(&s_lock);
     uint16_t conn = s_owner;
     portEXIT_CRITICAL(&s_lock);
-    if (conn >= OTA_OWNER_USB) return;
+    if (conn >= OTA_OWNER_WEB) return;
     uint8_t status[20];
     ble_ota_status_for(conn, status);
     static uint32_t requested_session;
@@ -190,7 +192,7 @@ static void publish(uint8_t state, uint8_t op, uint32_t error)
     s_op = op;
     s_error = error;
     s_busy = false;
-    bool notify = s_notifications_ready && s_owner < OTA_OWNER_USB;
+    bool notify = s_notifications_ready && s_owner < OTA_OWNER_WEB;
     portEXIT_CRITICAL(&s_lock);
     if (notify)
         ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &s_notify_event);
@@ -396,8 +398,11 @@ esp_err_t ble_ota_submit(uint16_t owner, uint8_t op, const uint8_t *payload, siz
     }
     bool active = s_state >= PREPARING && s_state <= READY;
     unsigned transport = owner_transport(owner);
+    /* The HTTP handler has authenticated the complete upload with its setup code. */
+    bool authorized = owner == OTA_OWNER_WEB ||
+        ota_window_open(now, s_armed_until, s_armed_transports, transport);
     if ((active && s_owner != owner) ||
-        (job.op == BEGIN && (active || !ota_window_open(now, s_armed_until, s_armed_transports, transport))) ||
+        (job.op == BEGIN && (active || !authorized)) ||
         (job.op != BEGIN && (!active || s_owner != owner))) {
         portEXIT_CRITICAL(&s_lock); return ESP_ERR_NOT_ALLOWED;
     }
@@ -410,6 +415,60 @@ esp_err_t ble_ota_submit(uint16_t owner, uint8_t op, const uint8_t *payload, siz
         return ESP_ERR_INVALID_STATE;
     }
     return ESP_OK;
+}
+
+static esp_err_t web_ota_step(uint8_t op, const uint8_t *payload, size_t length,
+                              uint8_t expected_state, size_t received, bool *started)
+{
+    esp_err_t err = ble_ota_submit(OTA_OWNER_WEB, op, payload, length);
+    if (err != ESP_OK) return err;
+    *started = true;
+    const int64_t deadline = esp_timer_get_time() + 30000000;
+    for (;;) {
+        uint8_t status[20];
+        ble_ota_status_for(OTA_OWNER_WEB, status);
+        if (!(status[3] & 2)) {
+            if (status[2] != op) return ESP_ERR_INVALID_STATE;
+            uint32_t error = get32(status + 12);
+            if (error) return (esp_err_t)error;
+            return status[1] == expected_state && get32(status + 4) == received
+                ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+        }
+        if (esp_timer_get_time() >= deadline) return ESP_ERR_TIMEOUT;
+        vTaskDelay(1);
+    }
+}
+
+esp_err_t ble_ota_web_update(const uint8_t *image, size_t size,
+                            void (*report)(const char *, size_t, size_t))
+{
+    uint8_t payload[OTA_MAX_PAYLOAD];
+    size_t digest_size;
+    report("prepare", 0, size);
+    put32(payload, size);
+    if (psa_hash_compute(PSA_ALG_SHA_256, image, size, payload + 4, 32, &digest_size) != PSA_SUCCESS ||
+        digest_size != 32) return ESP_FAIL;
+
+    bool started = false;
+    esp_err_t err = web_ota_step(BEGIN, payload, 36, RECEIVING, 0, &started);
+    for (size_t offset = 0; err == ESP_OK && offset < size;) {
+        size_t count = size - offset < sizeof(payload) - 4 ? size - offset : sizeof(payload) - 4;
+        put32(payload, offset);
+        memcpy(payload + 4, image + offset, count);
+        offset += count;
+        err = web_ota_step(DATA, payload, count + 4, RECEIVING, offset, &started);
+        if (err == ESP_OK) report("program", offset, size);
+    }
+    if (err == ESP_OK) {
+        report("verify", size, size);
+        err = web_ota_step(FINISH, NULL, 0, READY, size, &started);
+    }
+    if (err == ESP_OK) {
+        report("activate", size, size);
+        err = web_ota_step(ACTIVATE, NULL, 0, REBOOTING, size, &started);
+    }
+    if (err != ESP_OK && started) ble_ota_disconnected(OTA_OWNER_WEB);
+    return err;
 }
 
 #ifdef CONFIG_BLE_OTA_REQUIRE_ENCRYPTION

@@ -21,6 +21,8 @@ idf_component_register(
         "front_panel.c"
         "front_panel_lcd.c"
         "web_config.c"
+        "web_jobs.c"
+        "target_flash_h743.c"
     INCLUDE_DIRS "include"
     EMBED_FILES "web_config.html"
     REQUIRES

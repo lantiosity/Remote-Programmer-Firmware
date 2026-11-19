@@ -27,9 +27,12 @@ void ble_ota_status_for(uint16_t owner, uint8_t out[20]);
 size_t ble_ota_info(char *out, size_t capacity);
 void ble_ota_boot_confirm(bool healthy);
 
-/* Shared OTA engine. Owners below 0xFFFD are BLE connection handles.
- * USB/TCP adapters use the reserved owners and the same window/session lock. */
+/* Reserved transport owners for the shared update engine. */
 #define OTA_OWNER_USB 0xFFFDu
 #define OTA_OWNER_WIFI 0xFFFEu
 #define OTA_MAX_PAYLOAD 1028u
 esp_err_t ble_ota_submit(uint16_t owner, uint8_t op, const uint8_t *payload, size_t length);
+
+/* The caller has staged a complete image and authenticated its upload. */
+esp_err_t ble_ota_web_update(const uint8_t *image, size_t size,
+                            void (*report)(const char *, size_t, size_t));
