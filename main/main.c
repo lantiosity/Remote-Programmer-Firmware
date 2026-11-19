@@ -30,6 +30,7 @@
 #include "probe_core.h"
 #include "serial_bridge.h"
 #include "usb_dev.h"
+#include "web_config.h"
 #include "wired_ota.h"
 
 static const char *TAG = "main";
@@ -81,6 +82,7 @@ void app_main(void)
     }
 
     err = net_dev_init();
+    const bool network_ready = err == ESP_OK;
     if (err != ESP_OK) {
         healthy = false;
         ESP_LOGE(TAG, "WiFi 初始化失败: %s", esp_err_to_name(err));
@@ -99,6 +101,10 @@ void app_main(void)
              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     if (wired_ota_net_start() != ESP_OK) healthy = false;
     if (console_start() != ESP_OK) healthy = false;
+    if (network_ready) {
+        err = web_config_start();
+        if (err != ESP_OK) ESP_LOGW(TAG, "Web config startup failed: %s", esp_err_to_name(err));
+    }
 #ifdef CONFIG_LINK_BLE_ENABLE
     healthy = healthy && ble_dev_ready();
 #endif

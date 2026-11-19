@@ -20,7 +20,9 @@ idf_component_register(
         "console_cmds.c"
         "front_panel.c"
         "front_panel_lcd.c"
+        "web_config.c"
     INCLUDE_DIRS "include"
+    EMBED_FILES "web_config.html"
     REQUIRES
         espressif__esp_tinyusb
         driver
@@ -44,4 +46,5 @@ idf_component_register(
         esp_driver_sdmmc
         fatfs
         sdmmc
+        esp_http_server
 )

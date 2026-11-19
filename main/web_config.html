@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP-SWD 配置</title>
+<style>
+  :root { color-scheme:light dark; --bg:#f3f5f3; --paper:#fff; --ink:#172d28; --sub:#48615a; --line:#cbd8d2; --accent:#00634f; }
+  @media (prefers-color-scheme:dark) { :root { --bg:#111a17; --paper:#1b2924; --ink:#eef8f2; --sub:#b7cec2; --line:#395248; --accent:#137d63; } }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.55 system-ui,sans-serif; }
+  main { max-width:640px; margin:auto; padding:36px 18px; }
+  h1 { margin:0; font-size:2rem; letter-spacing:-.035em; }
+  h2 { margin:0; font-size:1.15rem; }
+  p { margin:.5em 0 1em; }
+  .sub { color:var(--sub); }
+  section { padding:20px; margin:18px 0; border:1px solid var(--line); border-radius:14px; background:var(--paper); }
+  dl { display:grid; grid-template-columns:6em 1fr; gap:5px 12px; margin-bottom:0; }
+  dt { color:var(--sub); }
+  dd { margin:0; overflow-wrap:anywhere; }
+  label { display:block; font-weight:600; margin:12px 0 5px; }
+  input,button { font:inherit; border:1px solid var(--line); border-radius:8px; padding:9px 12px; }
+  input { width:100%; background:var(--bg); color:var(--ink); }
+  button { cursor:pointer; background:var(--paper); color:var(--ink); }
+  button:disabled { opacity:.55; cursor:default; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
+  #message { min-height:1.55em; margin-bottom:0; color:var(--sub); }
+</style>
+<main>
+  <h1>ESP-SWD 配置</h1>
+  <section aria-labelledby="device-title">
+    <h2 id="device-title">设备状态</h2>
+    <dl>
+      <dt>设备</dt><dd id="device">读取中…</dd>
+      <dt>Wi-Fi</dt><dd id="network">—</dd>
+      <dt>当前地址</dt><dd id="ip">—</dd>
+      <dt>热点地址</dt><dd id="ap">—</dd>
+    </dl>
+  </section>
+  <section aria-labelledby="wifi-title">
+    <h2 id="wifi-title">配置 Wi-Fi</h2>
+    <p class="sub">长按设备 BOOT 约 2 秒，在屏幕上查看 WEB 配置码。也可在 UART 控制台运行 <code>webcfg arm</code>。</p>
+    <p id="window" class="sub" aria-live="polite">正在查询配置窗口…</p>
+    <form id="settings" autocomplete="off">
+      <label for="code">配置码</label>
+      <input id="code" type="password" maxlength="12" autocomplete="off" autocapitalize="characters" spellcheck="false" required>
+      <label for="ssid">Wi-Fi 名称（SSID）</label>
+      <input id="ssid" maxlength="32" autocomplete="off" spellcheck="false">
+      <label for="password">Wi-Fi 密码</label>
+      <input id="password" type="password" maxlength="63" autocomplete="new-password" placeholder="开放网络可留空">
+      <div class="actions">
+        <button id="save" class="primary" type="submit" disabled>保存并重启</button>
+        <button id="clear" type="button" disabled>清除 Wi-Fi 配置</button>
+      </div>
+    </form>
+    <p id="message" role="status"></p>
+  </section>
+</main>
+<script>
+  'use strict';
+  const get = id => document.getElementById(id);
+  const encoder = new TextEncoder();
+  let unlocked = false;
+  let pending = false;
+  const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  function buttons() {
+    get('save').disabled = get('clear').disabled = pending || !unlocked;
+  }
+  async function refresh() {
+    if (pending) return;
+    try {
+      const response = await fetch('/api/status', {cache:'no-store'});
+      if (!response.ok) throw new Error();
+      const s = await response.json();
+      if (pending) return;
+      const bytes = (s.ssid_hex.match(/../g) || []).map(pair => parseInt(pair, 16));
+      const name = new TextDecoder().decode(Uint8Array.from(bytes));
+      get('device').textContent = `${s.serial} · ${s.version}`;
+      get('network').textContent = s.connected ? `已连接 ${name}` : name ? `已配置 ${name}，未连接` : '未配置路由器';
+      get('ip').textContent = s.ip;
+      get('ap').textContent = s.ap_ip;
+      unlocked = s.setup_open;
+      get('window').textContent = unlocked ? '配置窗口已开启' : '配置窗口已关闭';
+    } catch {
+      unlocked = false;
+      get('window').textContent = '暂时无法读取设备状态';
+    }
+    buttons();
+  }
+  async function change(clear) {
+    if (pending || !unlocked) return;
+    const code = get('code').value.trim().toUpperCase();
+    if (!/^[0-9A-F]{12}$/.test(code)) {
+      get('message').textContent = '请输入设备显示的 12 位配置码。';
+      get('code').focus();
+      return;
+    }
+    const headers = {'X-Setup-Code':code};
+    let body;
+    if (clear) {
+      if (!window.confirm('清除已保存的 Wi-Fi 设置并重启设备？')) return;
+    } else {
+      const ssid = encoder.encode(get('ssid').value);
+      const password = encoder.encode(get('password').value);
+      if (!ssid.length || ssid.length > 32 || ssid.includes(0) || password.includes(0) ||
+          (password.length && (password.length < 8 || password.length > 63))) {
+        get('message').textContent = 'SSID 需为 1～32 字节，密码需为 8～63 字节或留空。';
+        return;
+      }
+      headers['Content-Type'] = 'application/json';
+      body = JSON.stringify({ssid_hex:hex(ssid), password_hex:hex(password)});
+    }
+    pending = true;
+    buttons();
+    get('message').textContent = '正在保存…';
+    try {
+      const response = await fetch(clear ? '/api/wifi/clear' : '/api/wifi', {method:'POST', headers, body});
+      if (!response.ok) {
+        const errors = {400:'Wi-Fi 设置无效。', 403:'配置码错误或已过期。', 409:'设备正在升级或重启，请稍后重试。'};
+        get('message').textContent = errors[response.status] || '设备未能应用配置。';
+        return;
+      }
+      unlocked = false;
+      get('settings').reset();
+      get('message').textContent = '设置已保存，设备正在重启。地址变化时，请重新连接设备热点或打开新的局域网地址。';
+    } catch {
+      get('message').textContent = '连接已中断。重新连接设备后核对 Wi-Fi 状态。';
+    } finally {
+      pending = false;
+      buttons();
+    }
+  }
+  get('settings').addEventListener('submit', event => { event.preventDefault(); change(false); });
+  get('clear').addEventListener('click', () => change(true));
+  refresh();
+  setInterval(refresh, 4000);
+</script>
+</html>
