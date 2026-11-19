@@ -57,7 +57,7 @@ WiFi 凭据通过运行时配网保存到设备 NVS，不提交到源码。默�
 
 开发版支持写入型 SPI3 ST7789 240×320、独立 1-bit SDMMC 与六个按键。LCD 和 SDMMC 均使用 DMA。详见[面板接线与操作](docs/FRONT_PANEL.md)。
 
-开发版可通过浏览器查看设备状态和配置路由器 Wi-Fi。连接设备热点后打开 `http://192.168.4.1/`，或在同一局域网打开设备当前 IPv4 地址。修改前长按 BOOT 约 2 秒读取 LCD 配置码，或在 UART 控制台运行 `webcfg arm`。详见[网页配置说明](docs/WEB_CONFIG.md)。
+开发版网页支持 STM32H743VI 烧录、目标串口监视、ESP-SWD OTA 和 Wi-Fi 配置。连接设备热点后打开 `http://192.168.4.1/`，或在同一局域网打开设备当前 IPv4 地址。操作前长按 BOOT 约 2 秒读取 LCD 配置码，或在 UART 控制台运行 `webcfg arm`。详见[固件网页使用说明](docs/WEB_CONFIG.md)。
 
 SWD 支持按连接独占，配网与 OTA 互斥，UART 使用独立发送队列。配置为无 nRESET 时，探针复位返回错误，软件复位由调试器选择目标核后发起。
 

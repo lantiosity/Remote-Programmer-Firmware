@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ESP-SWD 配置</title>
+<title>ESP-SWD</title>
 <style>
   :root { color-scheme:light dark; --bg:#f3f5f3; --paper:#fff; --ink:#172d28; --sub:#48615a; --line:#cbd8d2; --accent:#00634f; }
   @media (prefers-color-scheme:dark) { :root { --bg:#111a17; --paper:#1b2924; --ink:#eef8f2; --sub:#b7cec2; --line:#395248; --accent:#137d63; } }
@@ -17,6 +17,7 @@
   dl { display:grid; grid-template-columns:6em 1fr; gap:5px 12px; margin-bottom:0; }
   dt { color:var(--sub); }
   dd { margin:0; overflow-wrap:anywhere; }
+  h2 + p { margin-bottom:.75em; }
   label { display:block; font-weight:600; margin:12px 0 5px; }
   input,button { font:inherit; border:1px solid var(--line); border-radius:8px; padding:9px 12px; }
   input { width:100%; background:var(--bg); color:var(--ink); }
@@ -24,10 +25,15 @@
   button:disabled { opacity:.55; cursor:default; }
   button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
   .actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:16px; }
-  #message { min-height:1.55em; margin-bottom:0; color:var(--sub); }
+  .check { display:flex; align-items:center; gap:8px; font-weight:400; }
+  .check input { width:auto; }
+  .message { min-height:1.55em; margin-bottom:0; color:var(--sub); }
+  progress { width:100%; margin-top:12px; accent-color:var(--accent); }
+  pre { height:15rem; overflow:auto; margin-bottom:0; background:var(--bg); border:1px solid var(--line);
+    border-radius:8px; padding:12px; white-space:pre-wrap; overflow-wrap:anywhere; font-size:.88rem; }
 </style>
 <main>
-  <h1>ESP-SWD 配置</h1>
+  <h1>ESP-SWD</h1>
   <section aria-labelledby="device-title">
     <h2 id="device-title">设备状态</h2>
     <dl>
@@ -37,13 +43,50 @@
       <dt>热点地址</dt><dd id="ap">—</dd>
     </dl>
   </section>
-  <section aria-labelledby="wifi-title">
-    <h2 id="wifi-title">配置 Wi-Fi</h2>
+  <section aria-labelledby="access-title">
+    <h2 id="access-title">操作授权</h2>
     <p class="sub">长按设备 BOOT 约 2 秒，在屏幕上查看 WEB 配置码。也可在 UART 控制台运行 <code>webcfg arm</code>。</p>
     <p id="window" class="sub" aria-live="polite">正在查询配置窗口…</p>
+    <label for="code">配置码</label>
+    <input id="code" type="password" maxlength="12" autocomplete="off" autocapitalize="characters" spellcheck="false">
+  </section>
+  <section aria-labelledby="flash-title">
+    <h2 id="flash-title">目标芯片烧录</h2>
+    <p class="sub">STM32H743VI（2 MiB）。连接 SWDIO、SWCLK、NRST 和 GND，给目标板供电。</p>
+    <form id="flash-form">
+      <label for="flash-file">目标固件（.bin）</label>
+      <input id="flash-file" type="file" accept=".bin" required>
+      <label for="flash-address">烧录地址（128 KiB 扇区起点）</label>
+      <input id="flash-address" value="0x08000000" pattern="0[xX][0-9a-fA-F]{1,8}" spellcheck="false" required>
+      <label class="check"><input id="reset-run" type="checkbox">校验通过后复位运行</label>
+      <div class="actions"><button id="flash-start" class="primary" disabled>擦除并烧录</button></div>
+    </form>
+    <progress id="flash-progress" value="0" max="1" aria-label="目标芯片烧录进度" hidden></progress>
+    <p id="flash-message" class="message" role="status"></p>
+  </section>
+  <section aria-labelledby="serial-title">
+    <h2 id="serial-title">目标串口监视</h2>
+    <div class="actions">
+      <button id="serial-start" class="primary" disabled>开始监视</button>
+      <button id="serial-clear" type="button">清空显示</button>
+    </div>
+    <pre id="serial-output" tabindex="0" aria-label="目标串口输出"></pre>
+    <p id="serial-message" class="message" role="status"></p>
+  </section>
+  <section aria-labelledby="ota-title">
+    <h2 id="ota-title">ESP-SWD 固件 OTA</h2>
+    <p class="sub">选择 OTA 应用镜像 <code>esp_swdlink.bin</code>。校验通过后设备会重启。</p>
+    <form id="ota-form">
+      <label for="ota-file">ESP-SWD 固件（.bin）</label>
+      <input id="ota-file" type="file" accept=".bin" required>
+      <div class="actions"><button id="ota-start" class="primary" disabled>上传并升级</button></div>
+    </form>
+    <progress id="ota-progress" value="0" max="1" aria-label="ESP-SWD 固件升级进度" hidden></progress>
+    <p id="ota-message" class="message" role="status"></p>
+  </section>
+  <section aria-labelledby="wifi-title">
+    <h2 id="wifi-title">配置 Wi-Fi</h2>
     <form id="settings" autocomplete="off">
-      <label for="code">配置码</label>
-      <input id="code" type="password" maxlength="12" autocomplete="off" autocapitalize="characters" spellcheck="false" required>
       <label for="ssid">Wi-Fi 名称（SSID）</label>
       <input id="ssid" maxlength="32" autocomplete="off" spellcheck="false">
       <label for="password">Wi-Fi 密码</label>
@@ -53,7 +96,7 @@
         <button id="clear" type="button" disabled>清除 Wi-Fi 配置</button>
       </div>
     </form>
-    <p id="message" role="status"></p>
+    <p id="message" class="message" role="status"></p>
   </section>
 </main>
 <script>
@@ -62,16 +105,31 @@
   const encoder = new TextEncoder();
   let unlocked = false;
   let pending = false;
+  let monitor = null;
   const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const readJson = async path => {
+    const response = await fetch(path, {cache:'no-store', signal:AbortSignal.timeout(5000)});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  };
   function buttons() {
     get('save').disabled = get('clear').disabled = pending || !unlocked;
+    get('flash-start').disabled = get('ota-start').disabled = pending || !unlocked;
+    get('serial-start').disabled = !monitor && !unlocked;
+    get('serial-start').textContent = monitor ? '停止监视' : '开始监视';
+  }
+  function accessCode(message) {
+    const code = get('code').value.trim().toUpperCase();
+    if (/^[0-9A-F]{12}$/.test(code)) return code;
+    message.textContent = '请输入设备显示的 12 位配置码。';
+    get('code').focus();
+    return '';
   }
   async function refresh() {
     if (pending) return;
     try {
-      const response = await fetch('/api/status', {cache:'no-store'});
-      if (!response.ok) throw new Error();
-      const s = await response.json();
+      const s = await readJson('/api/status');
       if (pending) return;
       const bytes = (s.ssid_hex.match(/../g) || []).map(pair => parseInt(pair, 16));
       const name = new TextDecoder().decode(Uint8Array.from(bytes));
@@ -89,12 +147,8 @@
   }
   async function change(clear) {
     if (pending || !unlocked) return;
-    const code = get('code').value.trim().toUpperCase();
-    if (!/^[0-9A-F]{12}$/.test(code)) {
-      get('message').textContent = '请输入设备显示的 12 位配置码。';
-      get('code').focus();
-      return;
-    }
+    const code = accessCode(get('message'));
+    if (!code) return;
     const headers = {'X-Setup-Code':code};
     let body;
     if (clear) {
@@ -121,6 +175,7 @@
         return;
       }
       unlocked = false;
+      get('code').value = '';
       get('settings').reset();
       get('message').textContent = '设置已保存，设备正在重启。地址变化时，请重新连接设备热点或打开新的局域网地址。';
     } catch {
@@ -130,8 +185,173 @@
       buttons();
     }
   }
+  const phases = {queued:'正在排队', connect:'正在连接目标', erase:'正在擦除扇区',
+    prepare:'正在准备 OTA', program:'正在写入', verify:'正在校验', activate:'正在设置启动分区'};
+  const flashErrors = {ESP_ERR_INVALID_STATE:'SWD 正被其他客户端占用，请断开调试会话后重试',
+    ESP_ERR_NOT_SUPPORTED:'芯片型号或 Flash 容量不匹配', ESP_ERR_INVALID_CRC:'读回校验不匹配',
+    ESP_ERR_NOT_ALLOWED:'目标 Flash 配置受限或扇区受到保护'};
+  async function confirmBoot(image, message) {
+    message.textContent = '设备正在重启，等待校验运行镜像…';
+    await wait(2500);
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      const info = await readJson('/api/ota-info').catch(() => null);
+      if (info && info.serial === image.serial && info.elf_sha256 === image.elf &&
+          info.running !== image.previousSlot && info.running === info.boot && info.image_state === 2) {
+        message.textContent = `OTA 完成，运行镜像已确认（${info.version}）。`;
+        return;
+      }
+      await wait(1500);
+    }
+    throw new Error('未能确认新镜像。请重新连接设备并检查运行版本。');
+  }
+  async function observeJob(kind, id, message, progress, otaImage) {
+    let misses = 0;
+    for (;;) {
+      const job = await readJson('/api/job').catch(() => null);
+      if (!job) {
+        if (++misses >= 5) {
+          if (otaImage) return confirmBoot(otaImage, message);
+          throw new Error('连接已中断，无法确认烧录结果。');
+        }
+      } else if (job.id !== id || job.kind !== kind) {
+        if (otaImage) return confirmBoot(otaImage, message);
+        throw new Error('无法找到此次烧录的状态。');
+      } else {
+        misses = 0;
+        progress.value = job.done / job.total;
+        const phase = phases[job.phase] || '正在处理';
+        if (job.error) {
+          const detail = kind === 'flash' ? flashErrors[job.error_name] : '';
+          throw new Error(`${phase}失败（${detail || '错误 0x' + (job.error >>> 0).toString(16)}）。`);
+        }
+        if (!job.active) {
+          if (otaImage) return confirmBoot(otaImage, message);
+          message.textContent = '烧录完成，读回校验通过。';
+          return;
+        }
+        message.textContent = `${phase} · ${Math.round(job.done / job.total * 100)}%`;
+      }
+      await wait(400);
+    }
+  }
+  async function upload(kind) {
+    if (pending || !unlocked) return;
+    const message = get(`${kind}-message`);
+    const code = accessCode(message);
+    if (!code) return;
+    const file = get(`${kind}-file`).files[0];
+    if (!file || !file.size || !/\.bin$/i.test(file.name)) {
+      message.textContent = '请选择非空的 .bin 固件。';
+      return;
+    }
+    const headers = {'X-Setup-Code':code, 'Content-Type':'application/octet-stream'};
+    const progress = get(`${kind}-progress`);
+    let otaImage = null;
+    pending = true;
+    buttons();
+    progress.hidden = true;
+    try {
+      if (kind === 'flash') {
+        const address = Number(get('flash-address').value);
+        const end = address + Math.ceil(file.size / 0x20000) * 0x20000;
+        if (address < 0x08000000 || address % 0x20000 || end > 0x08200000) {
+          throw new Error('地址须对齐 128 KiB 扇区，且文件必须放得进目标芯片的 Flash。');
+        }
+        const addr = value => '0x' + value.toString(16).toUpperCase().padStart(8, '0');
+        if (!window.confirm(`烧录 ${file.name} 将擦除 STM32 的 ${addr(address)}～${addr(end - 1)}。确认继续？`)) return;
+        headers['X-Flash-Address'] = String(address);
+        headers['X-Reset-Run'] = get('reset-run').checked ? '1' : '0';
+      } else {
+        const info = await readJson('/api/ota-info');
+        const bytes = new Uint8Array(await file.slice(0, 288).arrayBuffer());
+        const project = new TextDecoder().decode(bytes.slice(80, 112)).split('\0')[0];
+        if (file.size > info.slot_size) throw new Error('镜像超过设备当前 OTA 槽位大小。');
+        if (bytes.length < 288 || bytes[0] !== 0xe9 || bytes[12] !== 9 || bytes[13] !== 0 ||
+            hex(bytes.slice(32, 36)) !== '3254cdab' || project !== info.project) {
+          throw new Error('请选择本设备的 ESP-SWD OTA 应用镜像。');
+        }
+        otaImage = {elf:hex(bytes.slice(176, 208)), serial:info.serial, previousSlot:info.running};
+        if (!window.confirm(`用 ${file.name} 升级 ESP-SWD？设备将在校验后重启。`)) return;
+      }
+      progress.hidden = false;
+      progress.removeAttribute('value');
+      message.textContent = '正在上传完整镜像…';
+      const response = await fetch(`/api/${kind}`, {method:'POST', headers, body:file,
+        signal:AbortSignal.timeout(55000)});
+      if (!response.ok) {
+        const errors = {400:'镜像类型、地址或大小无效。', 403:'配置码错误或已过期。',
+          408:'镜像上传超时。', 409:'设备正忙，请稍后再试。', 500:'设备无法启动任务。'};
+        throw new Error(errors[response.status] || `上传失败（HTTP ${response.status}）。`);
+      }
+      const {id} = await response.json();
+      await observeJob(kind, id, message, progress, otaImage);
+    } catch (err) {
+      message.textContent = err.message || '操作失败。';
+    } finally {
+      if (!progress.hasAttribute('value')) progress.value = 0;
+      pending = false;
+      buttons();
+      refresh();
+    }
+  }
+  function appendSerial(text) {
+    const output = get('serial-output');
+    const follow = output.scrollHeight - output.clientHeight - output.scrollTop < 24;
+    output.textContent = (output.textContent + text).slice(-24000);
+    if (follow) output.scrollTop = output.scrollHeight;
+  }
+  async function toggleSerial() {
+    const message = get('serial-message');
+    if (monitor) {
+      monitor = null;
+      message.textContent = '监视已停止。';
+      buttons();
+      return;
+    }
+    const code = accessCode(message);
+    if (!code) return;
+    const current = {};
+    monitor = current;
+    buttons();
+    let cursor = null;
+    let decoder = new TextDecoder();
+    message.textContent = '正在连接目标串口…';
+    try {
+      while (monitor === current) {
+        const headers = {'X-Setup-Code':code};
+        if (cursor !== null) headers['X-Serial-Cursor'] = cursor;
+        const response = await fetch('/api/serial', {headers, cache:'no-store',
+          signal:AbortSignal.timeout(55000)});
+        if (!response.ok) throw new Error(response.status === 403 ?
+          '配置码错误或已过期，串口监视已停止。' : '无法读取目标串口。');
+        const data = await response.arrayBuffer();
+        if (monitor !== current) return;
+        cursor = response.headers.get('X-Serial-Next');
+        const dropped = Number(response.headers.get('X-Serial-Dropped'));
+        if (dropped) {
+          decoder = new TextDecoder();
+          appendSerial(`\n[缓冲区已覆盖 ${dropped} 字节]\n`);
+        }
+        if (data.byteLength) appendSerial(decoder.decode(data, {stream:true}));
+        const label = `接收中 · ${response.headers.get('X-Serial-Baud')} baud · UTF-8`;
+        if (message.textContent !== label) message.textContent = label;
+        await wait(data.byteLength ? 60 : 200);
+      }
+    } catch (err) {
+      if (monitor === current) {
+        monitor = null;
+        message.textContent = err.message;
+        buttons();
+      }
+    }
+  }
   get('settings').addEventListener('submit', event => { event.preventDefault(); change(false); });
   get('clear').addEventListener('click', () => change(true));
+  get('flash-form').addEventListener('submit', event => { event.preventDefault(); upload('flash'); });
+  get('ota-form').addEventListener('submit', event => { event.preventDefault(); upload('ota'); });
+  get('serial-start').addEventListener('click', toggleSerial);
+  get('serial-clear').addEventListener('click', () => { get('serial-output').textContent = ''; });
   refresh();
   setInterval(refresh, 4000);
 </script>
