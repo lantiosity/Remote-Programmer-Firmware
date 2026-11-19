@@ -1,4 +1,4 @@
-# ESP32 自身升级（0.1.3）
+# ESP32 自身升级（0.1.4）
 
 USB（CMSIS-DAP HID 扩展）、WiFi 和 BLE 共用 OTA 状态机。升级对象为 ESP32 应用镜像 `esp_swdlink.bin`，配套上位机为 WireLink 0.2.3。
 
@@ -18,7 +18,7 @@ USB（CMSIS-DAP HID 扩展）、WiFi 和 BLE 共用 OTA 状态机。升级对象
 
 ## 操作
 
-1. 选择发布包 [`esp_swdlink.bin`](../release/0.1.3/images/esp_swdlink.bin)，或自行构建的同名应用。
+1. 选择发布包 [`esp_swdlink.bin`](../release/0.1.4/images/esp_swdlink.bin)，或自行构建的同名应用。
 2. 停止其他烧录/调试任务，连接对应 USB、WiFi 或 BLE 链路。
 3. 运行状态下长按 BOOT 约 2 秒开放升级窗口，或在设备控制台执行 `ota arm`（默认 300 秒）。
 4. 在上位机的烧录器升级功能读取信息，再执行升级并等待设备重启。

@@ -49,6 +49,8 @@ USB-UART/CH343 也支持本命令：按相同步骤手动进入下载模式，�
 
 `partitions.csv` 同步附带供核对；offline 为原始存储预留区，当前没有离线烧录功能。首次安装或分区改变使用完整烧录，应用 OTA 不会迁移分区表。
 
+ST7789 240×320、1-bit SDMMC 和六个按键的接线及操作见 [面板说明](FRONT_PANEL.md)。
+
 日常 USB/WiFi/BLE OTA 只选择本目录的 **`esp_swdlink.bin`**。设备正常运行时长按 BOOT 约 2 秒开启升级窗口（不要同时复位），或 UART 控制台 `ota arm 300 wifi` / `ota arm 300 ble` 授权对应无线链路。USB 发起的授权仅允许 USB OTA，BLE OTA 默认要求加密连接，首次需通过操作系统配对。使用配套上位机的 ESP32 固件升级功能传输并激活。WiFi 默认热点 `ESP-SWD`、密码 请在 menuconfig 设置独立口令，热点地址 `192.168.4.1`，OTA 服务 TCP 5557。USB OTA 使用应用 HID 扩展，与上述 ROM 串口完整烧录不同。传输完成并校验后才切换 OTA 槽；应用启动后约 5 秒确认健康，未确认即复位时由 bootloader 回退。
 
 ## 接线与校验

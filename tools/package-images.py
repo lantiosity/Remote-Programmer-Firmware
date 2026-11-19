@@ -85,11 +85,13 @@ for name in expected:
     shutil.copyfile(build/name,target)
 shutil.copyfile(build/'flash_args',images/'flash_args')
 shutil.copyfile(root/'partitions.csv',images/'partitions.csv')
+shutil.copyfile(root/'docs/FRONT_PANEL.md',images/'FRONT_PANEL.md')
 (images/'README.md').write_text((root/'tools/flash-readme.md.in').read_text(encoding='utf-8').replace('@VERSION@',version),encoding='utf-8')
 config = {}
 for line in (root/'sdkconfig').read_text(encoding='utf-8').splitlines():
     if line.startswith(('CONFIG_SPIRAM_','CONFIG_ESPTOOLPY_FLASH','CONFIG_BT_NIMBLE_MAX_CONNECTIONS=',
-                        'CONFIG_BLE_OTA_REQUIRE_ENCRYPTION=','CONFIG_OTA_','CONFIG_LINK_OTA_TCP_PORT=')) and '=' in line:
+                        'CONFIG_BLE_OTA_REQUIRE_ENCRYPTION=','CONFIG_OTA_','CONFIG_LINK_OTA_TCP_PORT=',
+                        'CONFIG_FRONT_PANEL_','CONFIG_FRONT_LCD_')) and '=' in line:
         key,value = line.split('=',1)
         config[key] = value
 manifest = {'project':'esp_swdlink','version':version,'kind':'flash-images','source_commit':commit,
