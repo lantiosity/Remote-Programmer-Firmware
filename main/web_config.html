@@ -19,8 +19,8 @@
   dd { margin:0; overflow-wrap:anywhere; }
   h2 + p { margin-bottom:.75em; }
   label { display:block; font-weight:600; margin:12px 0 5px; }
-  input,button { font:inherit; border:1px solid var(--line); border-radius:8px; padding:9px 12px; }
-  input { width:100%; background:var(--bg); color:var(--ink); }
+  input,select,button { font:inherit; border:1px solid var(--line); border-radius:8px; padding:9px 12px; }
+  input,select { width:100%; background:var(--bg); color:var(--ink); }
   button { cursor:pointer; background:var(--paper); color:var(--ink); }
   button:disabled { opacity:.55; cursor:default; }
   button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
@@ -87,6 +87,12 @@
   <section aria-labelledby="wifi-title">
     <h2 id="wifi-title">配置 Wi-Fi</h2>
     <form id="settings" autocomplete="off">
+      <div class="actions"><button id="wifi-scan" type="button" disabled>扫描附近 Wi-Fi</button></div>
+      <p id="scan-message" class="message" role="status" hidden></p>
+      <div id="scan-results" hidden>
+        <label for="wifi-network">附近网络</label>
+        <select id="wifi-network"></select>
+      </div>
       <label for="ssid">Wi-Fi 名称（SSID）</label>
       <input id="ssid" maxlength="32" autocomplete="off" spellcheck="false">
       <label for="password">Wi-Fi 密码</label>
@@ -106,7 +112,11 @@
   let unlocked = false;
   let pending = false;
   let monitor = null;
+  let scannedSsid = '';
   const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  const ssidDecoder = new TextDecoder('utf-8', {ignoreBOM:true});
+  const decodeSsid = value => ssidDecoder.decode(Uint8Array.from(
+    (value.match(/../g) || []).map(pair => parseInt(pair, 16))));
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
   const readJson = async path => {
     const response = await fetch(path, {cache:'no-store', signal:AbortSignal.timeout(5000)});
@@ -114,7 +124,8 @@
     return response.json();
   };
   function buttons() {
-    get('save').disabled = get('clear').disabled = pending || !unlocked;
+    get('save').disabled = get('clear').disabled = get('wifi-scan').disabled = pending || !unlocked;
+    get('wifi-network').disabled = pending || !unlocked;
     get('flash-start').disabled = get('ota-start').disabled = pending || !unlocked;
     get('serial-start').disabled = !monitor && !unlocked;
     get('serial-start').textContent = monitor ? '停止监视' : '开始监视';
@@ -131,8 +142,7 @@
     try {
       const s = await readJson('/api/status');
       if (pending) return;
-      const bytes = (s.ssid_hex.match(/../g) || []).map(pair => parseInt(pair, 16));
-      const name = new TextDecoder().decode(Uint8Array.from(bytes));
+      const name = decodeSsid(s.ssid_hex);
       get('device').textContent = `${s.serial} · ${s.version}`;
       get('network').textContent = s.connected ? `已连接 ${name}` : name ? `已配置 ${name}，未连接` : '未配置路由器';
       get('ip').textContent = s.ip;
@@ -145,6 +155,58 @@
     }
     buttons();
   }
+  async function scanWifi() {
+    if (pending || !unlocked) return;
+    const message = get('scan-message');
+    message.hidden = false;
+    const code = accessCode(message);
+    if (!code) return;
+    const headers = {'X-Setup-Code':code};
+    pending = true;
+    buttons();
+    get('scan-results').hidden = true;
+    message.textContent = '正在扫描附近的 2.4 GHz 网络…';
+    const request = async method => {
+      const response = await fetch('/api/wifi/scan', {method, headers, cache:'no-store',
+        signal:AbortSignal.timeout(5000)});
+      if (response.status === 403) throw new Error('配置码错误或已过期。');
+      if (response.status === 409) throw new Error('Wi-Fi 正在连接或设备正忙，请稍后重试。');
+      if (!response.ok) throw new Error('扫描失败，请重试。');
+      return response.json();
+    };
+    try {
+      const {id} = await request('POST');
+      const deadline = Date.now() + 15000;
+      let result;
+      do {
+        await wait(600);
+        result = await request('GET');
+        if (result.id !== id) throw new Error('扫描结果已更新，请重试。');
+      } while (result.running && Date.now() < deadline);
+      if (result.running) throw new Error('扫描超时，请重试。');
+      if (!result.networks.length) {
+        message.textContent = '未发现可见网络，可以手动填写 SSID。';
+        return;
+      }
+      const list = get('wifi-network');
+      list.replaceChildren(new Option('请选择网络', ''));
+      for (const network of result.networks) {
+        const name = decodeSsid(network.ssid_hex);
+        const security = network.open ? '开放' : '加密';
+        list.add(new Option(`${name} · ${network.rssi} dBm · 信道 ${network.channel} · ${security}`,
+          network.ssid_hex));
+      }
+      list.value = '';
+      get('scan-results').hidden = false;
+      message.textContent = `找到 ${result.networks.length} 个网络。`;
+    } catch (error) {
+      message.textContent = error.message || '扫描失败，请重试。';
+    } finally {
+      pending = false;
+      buttons();
+      refresh();
+    }
+  }
   async function change(clear) {
     if (pending || !unlocked) return;
     const code = accessCode(get('message'));
@@ -154,15 +216,16 @@
     if (clear) {
       if (!window.confirm('清除已保存的 Wi-Fi 设置并重启设备？')) return;
     } else {
-      const ssid = encoder.encode(get('ssid').value);
+      const manualSsid = encoder.encode(get('ssid').value);
+      const ssid = scannedSsid || hex(manualSsid);
       const password = encoder.encode(get('password').value);
-      if (!ssid.length || ssid.length > 32 || ssid.includes(0) || password.includes(0) ||
+      if (!ssid.length || ssid.length > 64 || (!scannedSsid && manualSsid.includes(0)) || password.includes(0) ||
           (password.length && (password.length < 8 || password.length > 63))) {
         get('message').textContent = 'SSID 需为 1～32 字节，密码需为 8～63 字节或留空。';
         return;
       }
       headers['Content-Type'] = 'application/json';
-      body = JSON.stringify({ssid_hex:hex(ssid), password_hex:hex(password)});
+      body = JSON.stringify({ssid_hex:ssid, password_hex:hex(password)});
     }
     pending = true;
     buttons();
@@ -176,6 +239,8 @@
       }
       unlocked = false;
       get('code').value = '';
+      scannedSsid = '';
+      get('scan-results').hidden = get('scan-message').hidden = true;
       get('settings').reset();
       get('message').textContent = '设置已保存，设备正在重启。地址变化时，请重新连接设备热点或打开新的局域网地址。';
     } catch {
@@ -348,6 +413,16 @@
   }
   get('settings').addEventListener('submit', event => { event.preventDefault(); change(false); });
   get('clear').addEventListener('click', () => change(true));
+  get('wifi-scan').addEventListener('click', scanWifi);
+  get('wifi-network').addEventListener('change', event => {
+    if (!event.target.value) return;
+    scannedSsid = event.target.value;
+    get('ssid').value = decodeSsid(scannedSsid);
+  });
+  get('ssid').addEventListener('input', () => {
+    scannedSsid = '';
+    get('wifi-network').value = '';
+  });
   get('flash-form').addEventListener('submit', event => { event.preventDefault(); upload('flash'); });
   get('ota-form').addEventListener('submit', event => { event.preventDefault(); upload('ota'); });
   get('serial-start').addEventListener('click', toggleSerial);

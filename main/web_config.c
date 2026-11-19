@@ -22,6 +22,7 @@
 #include "target_flash_h743.h"
 #include "web_config.h"
 #include "web_jobs.h"
+#include "wifi_setup.h"
 
 static const char *TAG = "web_config";
 static const char HEX[] = "0123456789ABCDEF";
@@ -279,6 +280,54 @@ static esp_err_t upload_conflict(httpd_req_t *req)
     return ESP_FAIL;
 }
 
+static esp_err_t wifi_scan(httpd_req_t *req)
+{
+    response_headers(req);
+    if (!local_request(req) || !authorized(req))
+        return upload_error(req, HTTPD_403_FORBIDDEN, "Setup code missing, invalid or expired");
+
+    httpd_resp_set_type(req, "application/json");
+    if (req->method == HTTP_POST) {
+        if (req->content_len)
+            return upload_error(req, HTTPD_400_BAD_REQUEST, "Expected an empty request");
+        if (web_job_status().active || ble_ota_in_progress()) return upload_conflict(req);
+        uint32_t id;
+        esp_err_t err = wifi_setup_web_scan_start(&id);
+        if (err == ESP_ERR_INVALID_STATE) return upload_conflict(req);
+        if (err != ESP_OK)
+            return upload_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Could not start Wi-Fi scan");
+        char body[32];
+        snprintf(body, sizeof(body), "{\"id\":%" PRIu32 "}", id);
+        httpd_resp_set_status(req, "202 Accepted");
+        return httpd_resp_sendstr(req, body);
+    }
+
+    wifi_setup_scan_t scan;
+    wifi_setup_web_scan_status(&scan);
+    if (scan.error == ESP_ERR_INVALID_STATE) return upload_conflict(req);
+    if (scan.error != ESP_OK)
+        return upload_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Wi-Fi scan failed");
+
+    const size_t capacity = 128 + 128 * scan.count;
+    char *body = malloc(capacity);
+    if (!body) return upload_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Scan buffer unavailable");
+    size_t length = snprintf(body, capacity, "{\"id\":%" PRIu32 ",\"running\":%s,\"networks\":[",
+        scan.id, scan.running ? "true" : "false");
+    for (uint16_t i = 0; i < scan.count; ++i) {
+        const wifi_setup_network_t *network = &scan.networks[i];
+        char ssid_hex[65];
+        to_hex(network->ssid, network->length, ssid_hex);
+        length += snprintf(body + length, capacity - length,
+            "%s{\"ssid_hex\":\"%s\",\"rssi\":%d,\"channel\":%u,\"open\":%s}",
+            i ? "," : "", ssid_hex, (int)network->rssi, (unsigned)network->channel,
+            network->open ? "true" : "false");
+    }
+    memcpy(body + length, "]}", 2);
+    esp_err_t err = httpd_resp_send(req, body, length + 2);
+    free(body);
+    return err;
+}
+
 static bool ota_header_valid(const uint8_t *image)
 {
     esp_image_header_t header;
@@ -434,7 +483,7 @@ esp_err_t web_config_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = 3;
-    config.max_uri_handlers = 9;
+    config.max_uri_handlers = 11;
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 3;
     config.send_wait_timeout = 3;
@@ -447,6 +496,8 @@ esp_err_t web_config_start(void)
         {.uri = "/api/status", .method = HTTP_GET, .handler = status},
         {.uri = "/api/wifi", .method = HTTP_POST, .handler = change_wifi},
         {.uri = "/api/wifi/clear", .method = HTTP_POST, .handler = change_wifi, .user_ctx = (void *)1},
+        {.uri = "/api/wifi/scan", .method = HTTP_POST, .handler = wifi_scan},
+        {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = wifi_scan},
         {.uri = "/api/flash", .method = HTTP_POST, .handler = upload},
         {.uri = "/api/ota", .method = HTTP_POST, .handler = upload, .user_ctx = (void *)1},
         {.uri = "/api/job", .method = HTTP_GET, .handler = job_status},

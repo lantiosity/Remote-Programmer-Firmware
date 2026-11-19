@@ -15,15 +15,16 @@
 
 #define REQUEST_SIZE 224
 #define REPLY_SIZE 512
-typedef struct { char text[REQUEST_SIZE]; bool usb; } job_t;
+typedef struct { char text[REQUEST_SIZE]; bool usb, web_scan; } job_t;
 static QueueHandle_t s_jobs;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_busy;
 static char s_reply[REPLY_SIZE] = "{\"id\":\"\",\"ok\":false,\"error\":\"no_request\"}";
 /* Scan cache/reply production belong to the single worker. BLE RX assembly
  * belongs only to NimBLE host callbacks; USB assembles its own request. */
-static wifi_ap_record_t s_networks[20];
+static wifi_ap_record_t s_networks[WIFI_SETUP_SCAN_MAX];
 static uint16_t s_count;
+static wifi_setup_scan_t s_web_scan;
 static char s_rx[REQUEST_SIZE];
 static size_t s_rx_len;
 static uint16_t s_rx_conn = BLE_HS_CONN_HANDLE_NONE;
@@ -65,11 +66,65 @@ static void fail(cJSON *root, const char *error)
     cJSON_ReplaceItemInObject(root, "ok", cJSON_CreateBool(false));
     cJSON_AddStringToObject(root, "error", error);
 }
+
+static esp_err_t scan_networks(wifi_ap_record_t *records, uint16_t *count)
+{
+    *count = 0;
+    if (ble_ota_in_progress()) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = esp_wifi_scan_start(NULL, true);
+    if (err != ESP_OK) return err;
+    *count = WIFI_SETUP_SCAN_MAX;
+    err = esp_wifi_scan_get_ap_records(count, records);
+    if (err != ESP_OK) {
+        (void)esp_wifi_clear_ap_list();
+        *count = 0;
+    }
+    return err;
+}
+
+static void finish_web_scan(void)
+{
+    wifi_setup_scan_t result = {.id = s_web_scan.id};
+    wifi_ap_record_t records[WIFI_SETUP_SCAN_MAX];
+    uint16_t count;
+    result.error = scan_networks(records, &count);
+    if (result.error == ESP_ERR_WIFI_STATE) result.error = ESP_ERR_INVALID_STATE;
+    /* ESP-IDF returns records in descending RSSI order; keep the strongest per SSID. */
+    for (uint16_t i = 0; i < count; ++i) {
+        const wifi_ap_record_t *ap = &records[i];
+        size_t length = strnlen((const char *)ap->ssid, sizeof(result.networks[0].ssid));
+        if (!length) continue;
+        bool duplicate = false;
+        for (uint16_t j = 0; j < result.count; ++j) {
+            const wifi_setup_network_t *previous = &result.networks[j];
+            if (previous->length == length && memcmp(previous->ssid, ap->ssid, length) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        wifi_setup_network_t *network = &result.networks[result.count++];
+        memcpy(network->ssid, ap->ssid, length);
+        network->length = length;
+        network->rssi = ap->rssi;
+        network->channel = ap->primary;
+        network->open = ap->authmode == WIFI_AUTH_OPEN;
+    }
+    portENTER_CRITICAL(&s_lock);
+    s_web_scan = result;
+    s_busy = false;
+    portEXIT_CRITICAL(&s_lock);
+}
+
 static void worker(void *unused)
 {
     (void)unused;
     job_t job;
     while (xQueueReceive(s_jobs, &job, portMAX_DELAY) == pdTRUE) {
+        if (job.web_scan) {
+            finish_web_scan();
+            continue;
+        }
         char *save = NULL;
         char *id = strtok_r(job.text, " ", &save);
         char *op = strtok_r(NULL, " ", &save);
@@ -88,11 +143,7 @@ static void worker(void *unused)
             unsigned page = 0;
             esp_err_t err = ESP_OK;
             if (!strcmp(op, "scan")) {
-                if (ble_ota_in_progress()) err = ESP_ERR_INVALID_STATE;
-                else err = esp_wifi_scan_start(NULL, true);
-                s_count = 20;
-                if (err == ESP_OK) err = esp_wifi_scan_get_ap_records(&s_count, s_networks);
-                if (err != ESP_OK) s_count = 0;
+                err = scan_networks(s_networks, &s_count);
             } else {
                 char *arg = strtok_r(NULL, " ", &save);
                 page = arg ? strtoul(arg, NULL, 10) : 0;
@@ -175,6 +226,38 @@ size_t wifi_setup_response(char *out, size_t capacity)
     size_t length = strlcpy(out, s_reply, capacity);
     portEXIT_CRITICAL(&s_lock);
     return length < capacity ? length : capacity - 1;
+}
+
+esp_err_t wifi_setup_web_scan_start(uint32_t *id)
+{
+    if (!s_jobs) return ESP_ERR_INVALID_STATE;
+    portENTER_CRITICAL(&s_lock);
+    if (s_busy) {
+        portEXIT_CRITICAL(&s_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_busy = true;
+    *id = ++s_web_scan.id;
+    s_web_scan.running = true;
+    s_web_scan.count = 0;
+    s_web_scan.error = ESP_OK;
+    portEXIT_CRITICAL(&s_lock);
+
+    const job_t job = {.web_scan = true};
+    if (xQueueSend(s_jobs, &job, 0) == pdTRUE) return ESP_OK;
+    portENTER_CRITICAL(&s_lock);
+    s_web_scan.running = false;
+    s_web_scan.error = ESP_ERR_TIMEOUT;
+    s_busy = false;
+    portEXIT_CRITICAL(&s_lock);
+    return ESP_ERR_TIMEOUT;
+}
+
+void wifi_setup_web_scan_status(wifi_setup_scan_t *result)
+{
+    portENTER_CRITICAL(&s_lock);
+    *result = s_web_scan;
+    portEXIT_CRITICAL(&s_lock);
 }
 #define WIFI_UUID(n) BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,0x93,0xf3,0xa3,0xb5,n,0x00,0x40,0x6e)
 static const ble_uuid128_t svc_uuid = WIFI_UUID(0x30), request_uuid = WIFI_UUID(0x31), reply_uuid = WIFI_UUID(0x32);
