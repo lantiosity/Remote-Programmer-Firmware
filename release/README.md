@@ -1,6 +1,17 @@
 # 固件版本归档
 
-当前固件为 **[0.1.4](0.1.4/)**，配套上位机 0.2.3。历史归档从 [0.1.0](0.1.0/) 起保留。
+当前固件为 **[0.1.3](0.1.3/)**，配套上位机 0.2.3。历史归档从 [0.1.0](0.1.0/) 起保留。
+
+0.1.4 已撤回。面板和网页配置已合并入当前源码，暂未重发。
+
+| 版本 | 独立 OTA 应用镜像 |
+| --- | --- |
+| 0.1.0 | [esp_swdlink.bin](0.1.0/images/esp_swdlink.bin) |
+| 0.1.1 | [esp_swdlink.bin](0.1.1/images/esp_swdlink.bin) |
+| 0.1.2 | [esp_swdlink.bin](0.1.2/images/esp_swdlink.bin) |
+| 0.1.3 | [esp_swdlink.bin](0.1.3/images/esp_swdlink.bin) |
+
+USB、WiFi 或 BLE OTA 请选择对应版本的应用镜像。今后的每个发布目录也保留 `images/esp_swdlink.bin` 和其 SHA256。
 
 各版均包含源码 ZIP、逐文件清单、SHA256，以及可直接烧录的 `images/` 和 `firmware-版本-flash.zip`。烧录步骤见 [固件 README](../README.md#直接烧录发布固件无需编译)。不包含工具链或依赖缓存。
 
