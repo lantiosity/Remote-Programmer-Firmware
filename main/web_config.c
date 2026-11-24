@@ -101,7 +101,8 @@ static bool local_request(httpd_req_t *req)
         if (strcmp(port, ":80")) return false;
         *port = '\0';
     }
-    return strcmp(host, net_dev_ap_ip()) == 0 ||
+    const char *ap_ip = net_dev_ap_ip();
+    return (ap_ip[0] && strcmp(host, ap_ip) == 0) ||
         (net_dev_sta_connected() && strcmp(host, net_dev_ip()) == 0);
 }
 
@@ -512,6 +513,6 @@ esp_err_t web_config_start(void)
     portENTER_CRITICAL(&s_lock);
     s_ready = true;
     portEXIT_CRITICAL(&s_lock);
-    ESP_LOGI(TAG, "Web configuration: http://%s/", net_dev_ap_ip());
+    ESP_LOGI(TAG, "Web configuration ready on the device IPv4 address");
     return ESP_OK;
 }

@@ -76,7 +76,7 @@ menu "ESP-SWD DAPLink 配置"
     menu "4. WiFi 链路"
 
         config LINK_WIFI_SSID
-            string "WiFi SSID (留空则只开热点)"
+            string "路由器 WiFi SSID (留空可运行时配网)"
             default ""
 
         config LINK_WIFI_PASSWORD
@@ -84,11 +84,11 @@ menu "ESP-SWD DAPLink 配置"
             default ""
 
         config LINK_AP_SSID
-            string "热点 SSID (STA 失败或未配置时启用)"
+            string "热点 SSID（填写热点口令后启用）"
             default "ESP-SWD"
 
         config LINK_AP_PASSWORD
-            string "热点密码 (至少 8 位)"
+            string "热点 WPA2 口令（8–63 字节，留空关闭热点）"
             default ""
 
         config LINK_TCP_PORT

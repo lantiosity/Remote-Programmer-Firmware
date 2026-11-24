@@ -1,6 +1,6 @@
 /**
  * @file  net_dev.c
- * @brief  WiFi 链路：AP + STA 共存，提供
+ * @brief  WiFi STA 和可选热点，提供
  *           - 5555 端口：pyOCD remote 探针（一行一条 JSON）
  *           - 5556 端口：目标串口原始字节桥
  */
@@ -27,14 +27,10 @@
 #include "serial_bridge.h"
 #include "usb_dev.h"
 
-_Static_assert(sizeof(CONFIG_LINK_AP_PASSWORD) >= 9 &&
-               sizeof(CONFIG_LINK_AP_PASSWORD) <= 64,
-               "Set a private WPA2 passphrase (8-63 bytes) in menuconfig");
-
 static const char *TAG = "net";
 
 static char     s_sta_ip[16] = "0.0.0.0";
-static char     s_ap_ip[16]  = "192.168.4.1";
+static char     s_ap_ip[16];
 static char     s_ssid[33];
 static bool     s_sta_connected;
 static bool     s_sta_configured;
@@ -404,7 +400,14 @@ esp_err_t net_dev_init(void)
     }
 
     s_sta_netif = esp_netif_create_default_wifi_sta();
-    s_ap_netif = esp_netif_create_default_wifi_ap();
+    const size_t ap_password_len = strlen(CONFIG_LINK_AP_PASSWORD);
+    const bool ap_enabled = ap_password_len != 0;
+    if (ap_enabled && (ap_password_len < 8 || ap_password_len > 63 ||
+                       strlen(CONFIG_LINK_AP_SSID) == 0 || strlen(CONFIG_LINK_AP_SSID) > 32)) {
+        ESP_LOGE(TAG, "热点要求 1–32 字节 SSID 和 8–63 字节 WPA2 口令");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ap_enabled) s_ap_netif = esp_netif_create_default_wifi_ap();
     esp_netif_set_hostname(s_sta_netif, "esp-swd");
 
     link_register_sender(LINK_SINK_TCP, tcp_dap_send);
@@ -424,23 +427,21 @@ esp_err_t net_dev_init(void)
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
 
-    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    err = esp_wifi_set_mode(ap_enabled ? WIFI_MODE_APSTA : WIFI_MODE_STA);
     if (err != ESP_OK) {
         return err;
     }
 
-    /* AP */
-    wifi_config_t ap_cfg;
-    memset(&ap_cfg, 0, sizeof(ap_cfg));
-    snprintf((char *)ap_cfg.ap.ssid, sizeof(ap_cfg.ap.ssid), "%s", CONFIG_LINK_AP_SSID);
-    ap_cfg.ap.ssid_len = (uint8_t)strlen(CONFIG_LINK_AP_SSID);
-    snprintf((char *)ap_cfg.ap.password, sizeof(ap_cfg.ap.password), "%s", CONFIG_LINK_AP_PASSWORD);
-    ap_cfg.ap.channel = 6;
-    ap_cfg.ap.max_connection = 4;
-    ap_cfg.ap.authmode = (strlen(CONFIG_LINK_AP_PASSWORD) >= 8) ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    if (err != ESP_OK) {
-        return err;
+    if (ap_enabled) {
+        wifi_config_t ap_cfg = {0};
+        ap_cfg.ap.ssid_len = (uint8_t)strlen(CONFIG_LINK_AP_SSID);
+        memcpy(ap_cfg.ap.ssid, CONFIG_LINK_AP_SSID, ap_cfg.ap.ssid_len);
+        memcpy(ap_cfg.ap.password, CONFIG_LINK_AP_PASSWORD, ap_password_len);
+        ap_cfg.ap.channel = 6;
+        ap_cfg.ap.max_connection = 4;
+        ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+        err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+        if (err != ESP_OK) return err;
     }
 
     /* STA */
@@ -453,13 +454,13 @@ esp_err_t net_dev_init(void)
         sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
         err = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "WiFi STA 配置无效，保留热点: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "WiFi STA 配置无效: %s", esp_err_to_name(err));
         } else {
             s_sta_configured = true;
             snprintf(s_ssid, sizeof(s_ssid), "%s", ssid);
         }
     } else {
-        ESP_LOGW(TAG, "未配置 WiFi，只开热点 %s (%s)", CONFIG_LINK_AP_SSID, s_ap_ip);
+        ESP_LOGW(TAG, "未配置路由器 WiFi，可通过 USB 或 BLE 配网");
     }
 
     err = esp_wifi_start();
@@ -468,7 +469,7 @@ esp_err_t net_dev_init(void)
     }
 
     esp_netif_ip_info_t ip;
-    if (esp_netif_get_ip_info(s_ap_netif, &ip) == ESP_OK) {
+    if (ap_enabled && esp_netif_get_ip_info(s_ap_netif, &ip) == ESP_OK) {
         snprintf(s_ap_ip, sizeof(s_ap_ip), IPSTR, IP2STR(&ip.ip));
     }
 
@@ -488,13 +489,13 @@ esp_err_t net_dev_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "热点: %s，地址 %s", CONFIG_LINK_AP_SSID, s_ap_ip);
+    if (ap_enabled) ESP_LOGI(TAG, "热点: %s，地址 %s", CONFIG_LINK_AP_SSID, s_ap_ip);
     return ESP_OK;
 }
 
 const char *net_dev_ip(void)
 {
-    return s_sta_connected ? s_sta_ip : s_ap_ip;
+    return s_sta_connected || !s_ap_ip[0] ? s_sta_ip : s_ap_ip;
 }
 
 const char *net_dev_ap_ip(void)

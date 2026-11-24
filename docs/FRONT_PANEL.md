@@ -1,6 +1,6 @@
 # ST7789、microSD 与六键面板
 
-固件 0.1.4 在 ESP32-S3 N16R8 上启用 240×320 ST7789、原生 1-bit SDMMC 和六个独立按键。LCD 使用 SPI3，像素数据通过 DMA 从内部 RAM 发送。microSD 使用 SDMMC 控制器的 DMA，SPI2 可继续用于高速 SWD。
+固件 0.1.5 在 ESP32-S3 N16R8 上启用 240×320 ST7789、原生 1-bit SDMMC 和六个独立按键。LCD 使用 SPI3，像素数据通过 DMA 从内部 RAM 发送。microSD 使用 SDMMC 控制器的 DMA，SPI2 可继续用于高速 SWD。
 
 | 外设 | 模块端信号 | ESP32-S3 |
 | --- | --- | --- |

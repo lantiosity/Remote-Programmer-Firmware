@@ -215,7 +215,8 @@ ESP-SWD DAPLink 配置
 └── 5. 蓝牙链路             LINK_BLE_ENABLE / LINK_BLE_NAME
 ```
 
-运行时还有 NVS 覆盖：WiFi 凭据（`wifi` / `wifihex` 命令）和目标串口波特率（`baud`）。
+路由器 Wi-Fi 凭据可在运行时写入 NVS。热点仅在构建时设置独立的 `LINK_AP_PASSWORD` 后启用，须使用 8–63 字节的 WPA2 口令。
+目标串口波特率可使用 `baud` 调整并保存在 NVS。
 
 ## 11. 已知问题 / 待办（来自代码审阅）
 
