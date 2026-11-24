@@ -18,7 +18,7 @@ USB（CMSIS-DAP HID 扩展）、WiFi、BLE 和内置网页共用 OTA 状态机�
 
 ## 操作
 
-1. 选择发布包 [`esp_swdlink.bin`](../release/0.1.5/images/esp_swdlink.bin)，或自行构建的同名应用。
+1. 选择本次构建生成的 `build/esp_swdlink.bin`。
 2. 停止其他烧录/调试任务，连接对应 USB、WiFi 或 BLE 链路。
 3. 运行状态下长按 BOOT 约 2 秒开放升级窗口，或在设备控制台执行 `ota arm`（默认 300 秒）。
 4. 在上位机的烧录器升级功能读取信息，再执行升级并等待设备重启。
@@ -39,7 +39,7 @@ SHA256 是完整性检查，当前协议不提供签名认证。授权窗口控�
 - 接收空闲超时默认 120 秒，FINISH 校验后等待激活默认 600 秒，分别由 `OTA_IDLE_TIMEOUT_SECONDS` / `OTA_READY_TIMEOUT_SECONDS` 配置。TCP 端口由 `LINK_OTA_TCP_PORT` 配置，默认仍为 5557，设备信息同步报告实际端口。
 - USB OTA 请求仍在 DAP worker 中等待共享 OTA worker 提交，最长 15 秒，但这段等待不持有 SWD 总线锁；升级期间请停止其他烧录/调试任务。
 
-本版物理设备 OTA、配对和回滚仍待验证。进入 ROM 下载模式进行完整安装的说明见 [README](../README.md#直接烧录发布固件无需编译)。
+本版物理设备 OTA、配对和回滚仍待验证。进入 ROM 下载模式进行完整安装的说明见 [README](../README.md#从源码烧录固件)。
 
 自 0.1.2 起，OTA status 的 Flags bit0 及 ARMED 状态反映当前查询链路，活动会话仍可显示繁忙。控制台保留全局授权状态。配网 status 的 armed 同样区分 USB/BLE。
 

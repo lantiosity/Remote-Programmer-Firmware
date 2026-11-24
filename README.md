@@ -1,23 +1,21 @@
 # ESP32-S3 远程烧录器固件 0.1.5
 
-独立固件源码仓库，配套 WireLink 上位机 **0.3.1**。固件支持 CMSIS-DAP、SWD、USB/WiFi/BLE、目标 UART 桥、ESP32 自身 OTA，以及本地面板、离线烧录和网页配置。
+独立固件源码仓库，配套 WireLink 上位机 **0.3.1**。固件支持 CMSIS-DAP、SWD、USB/WiFi/BLE、目标 UART 桥、ESP32 自身 OTA，以及本地面板、离线烧录和网页配置。[WireLink 上位机仓库](https://github.com/lantiosity/Remote-Programmer-Host)
 
-## 直接烧录发布固件（无需编译）
+## 从源码烧录固件
 
-可烧录文件位于 [`release/0.1.5/images/`](release/0.1.5/images/)，也可解压 [`firmware-0.1.5-flash.zip`](release/0.1.5/firmware-0.1.5-flash.zip) 单独使用。烧录对象是 **ESP32-S3 N16R8**（16 MiB Flash、8 MiB Octal PSRAM）。
+烧录对象是 **ESP32-S3 N16R8**（16 MiB Flash、8 MiB Octal PSRAM）。请先按下文[构建](#构建)，生成 `build/` 目录。
 
-1. 安装 Python 和 esptool：`python -m pip install esptool==5.6.0`。已激活 ESP-IDF 环境的用户可使用其自带 esptool。
-2. 用数据线连接 ESP32-S3 的原生 USB/OTG 口，按住 BOOT，按一下 RESET，再松开 BOOT；在设备管理器查看新出现的 ROM 下载串口。原生 USB 可以完成整套烧录，无需另接 USB 转串口。
-3. 在固件仓库目录打开 PowerShell，执行以下命令，把 `COM22` 换成实际下载端口：
+1. 用数据线连接 ESP32-S3 的原生 USB/OTG 口，按住 BOOT，按一下 RESET，再松开 BOOT。在设备管理器查看新出现的 ROM 下载串口。
+2. 在已激活 ESP-IDF 环境的 PowerShell 中进入固件仓库目录，将 `COMx` 换成实际下载端口。
 
 ```powershell
-cd release/0.1.5/images
-python -m esptool --chip esp32s3 --port COM22 --before no-reset --after hard-reset write-flash "@flash_args"
+idf.py -p COMx flash
 ```
 
-保持 `flash_args` 与各镜像的相对路径不变。esptool 会逐项写入并校验；完成后松开 BOOT，如仍停留在 ROM 下载口，只按一下 RESET。应用启动后应枚举 CMSIS-DAP HID 和 CDC 串口，端口号可能变化。USB-UART/CH343 口也可在手动进入下载模式后使用同一命令，改为对应 COM 口。
+烧录工具会逐项写入并校验。如设备仍停留在 ROM 下载口，松开 BOOT 后按一下 RESET。应用启动后应枚举 CMSIS-DAP HID 和 CDC 串口，端口号可能变化。手动进入下载模式后也可使用 USB-UART/CH343 口。
 
-| 文件（相对 images 目录） | 写入地址 | 用途 |
+| 文件（相对 `build/` 目录） | 写入地址 | 用途 |
 | --- | --- | --- |
 | `bootloader/bootloader.bin` | `0x0` | ESP32-S3 引导程序 |
 | `partition_table/partition-table.bin` | `0x8000` | 16 MiB 分区表 |
@@ -26,7 +24,7 @@ python -m esptool --chip esp32s3 --port COM22 --before no-reset --after hard-res
 
 完整安装会覆盖 factory 和 OTA 选择数据，重新从 factory 启动；命令按地址分别写入，不擦除 NVS、PHY 和 offline 区。已有设备应先备份重要数据，且不要启用全片擦除。factory 为 3 MiB，两个 OTA 槽各 4 MiB，offline 为 4.875 MiB，供离线烧录保存目标镜像。分区变化必须走完整安装，不能只传应用 OTA。
 
-日常 USB/WiFi/BLE 或网页 OTA 请选择 [`esp_swdlink.bin`](release/0.1.5/images/esp_swdlink.bin)。升级步骤、镜像清单及校验方式见 [OTA 操作说明](docs/OTA.md)和[烧录说明](release/0.1.5/images/README.md)。
+日常 USB、Wi-Fi、BLE 或网页 OTA 请选择 `build/esp_swdlink.bin`。[OTA 操作说明](docs/OTA.md)
 
 ## 构建
 
@@ -41,15 +39,13 @@ idf.py build
 
 默认 SWCLK=GPIO4、SWDIO=GPIO5、nRESET=GPIO6；目标 UART TX=GPIO17、RX=GPIO18；BOOT=GPIO0。请共地，按目标电平接线。
 
-首次安装使用 ROM 下载模式，连接 ESP32 自身 USB/UART，按住 BOOT 并复位，识别下载端口后使用 `idf.py -p COMx flash`。这会写 bootloader、分区表、factory 和初始 otadata；已有设备升级前应备份持久化数据。日常升级在配套上位机选择本次构建的 `build/esp_swdlink.bin`，参见 [升级说明](docs/OTA.md)。
-
 ## 配置与源码
 
 WiFi 凭据通过运行时配网保存到设备 NVS，不提交到源码。发布镜像默认关闭设备热点。首次联网可通过 WireLink 的 USB 或加密 BLE 配网；如需热点，自行构建时在 menuconfig 配置独立的 8–63 字节 WPA2 口令。长按 BOOT 约 2 秒开启本地配置/升级授权窗口；不要同时复位。
 
 `main/` 为固件实现，`partitions.csv` 是 16 MiB 分区布局。USB、BLE 和 CH343 控制台的配网协议共用 `wifi_setup.c`，设备信息以 `wifi_setup: 1` 声明 USB 配网能力。
 
-源码 ZIP、镜像与 SHA256 见 [0.1.5 发布说明](release/0.1.5/README.md)，版本变化见 [CHANGELOG](CHANGELOG.md)。
+版本变化见 [CHANGELOG](CHANGELOG.md)。打包源码和镜像时，参见[本地打包流程](release/README.md)。
 
 ## 运行行为与验证
 
