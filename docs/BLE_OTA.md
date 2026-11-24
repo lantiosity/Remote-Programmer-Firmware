@@ -1,6 +1,6 @@
 # BLE OTA 协议 v1
 
-固件 0.1.3 使用 BLE OTA 协议 v1，布局与操作见 [升级说明](OTA.md)。控制和数据写入默认要求 BLE 加密。所有 UUID 以 `-b5a3-f393-e0a9-e50e24dcca9e` 结尾。
+固件 0.1.4 使用 BLE OTA 协议 v1，布局与操作见 [升级说明](OTA.md)。控制和数据写入默认要求 BLE 加密。所有 UUID 以 `-b5a3-f393-e0a9-e50e24dcca9e` 结尾。
 
 | UUID 前缀 | 用途 |
 | --- | --- |
