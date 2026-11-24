@@ -1,0 +1,24 @@
+# Local environments, output and user settings
+.git/
+**/bin/
+**/obj/
+**/__pycache__/
+**/*.pyc
+.vs/
+.venv*/
+build/
+publish/
+portable/
+.publish-backup/
+.wirelink*.json
+data/
+*.user
+*.log
+managed_components/
+sdkconfig
+sdkconfig.old
+sdkconfig.*.old
+# Local review reports and cross-repository diagnostics are not release source.
+/docs/REVIEW_FIX_PLAN.md
+/docs/HOST_FIRMWARE_ALIGNMENT.md
+/tools/check-firmware-contract.py

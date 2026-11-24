@@ -1,0 +1,172 @@
+menu "ESP-SWD DAPLink 配置"
+
+    menu "1. SWD 引脚与调试口"
+
+        config PROBE_SWCLK_GPIO
+            int "SWCLK 引脚 (GPIO 编号)"
+            default 4
+            range 0 31
+            help
+                SWD 时钟线，接到目标板 SWCLK。
+
+        config PROBE_SWDIO_GPIO
+            int "SWDIO 引脚 (GPIO 编号)"
+            default 5
+            range 0 31
+            help
+                SWD 数据线，接到目标板 SWDIO。
+
+        config PROBE_NRESET_GPIO
+            int "nRESET 引脚 (-1 表示不接)"
+            default 6
+            help
+                可选。接到目标板 NRST，用于硬件复位与 DAP_ResetTarget。
+
+        config PROBE_DEFAULT_CLOCK_KHZ
+            int "SWD 默认时钟 (kHz)"
+            default 1000
+            range 100 50000
+            help
+                上电后的默认 SWD 请求频率，上位机可通过 DAP_SWJ_Clock 修改。
+                GPIO 位操作的实际频率受执行开销限制，不能等同于请求频率。
+
+    endmenu
+
+    menu "2. 目标串口 (虚拟串口转发)"
+
+        config TARGET_UART_PORT
+            int "UART 端口号 (0/1/2)"
+            default 1
+            range 0 2
+
+        config TARGET_UART_TX_GPIO
+            int "UART TX 引脚"
+            default 17
+
+        config TARGET_UART_RX_GPIO
+            int "UART RX 引脚"
+            default 18
+
+        config TARGET_UART_BAUD
+            int "UART 默认波特率"
+            default 115200
+
+    endmenu
+
+    menu "3. USB 设备"
+
+        config USB_DEVICE_VID
+            hex "USB VID"
+            default 0x0D28
+
+        config USB_DEVICE_PID
+            hex "USB PID"
+            default 0x0204
+
+        config USB_DEVICE_MANUFACTURER
+            string "USB 厂商字符串"
+            default "ESP-SWD"
+
+        config USB_DEVICE_PRODUCT
+            string "USB 产品字符串"
+            default "ESP32-S3 CMSIS-DAP"
+
+    endmenu
+
+    menu "4. WiFi 链路"
+
+        config LINK_WIFI_SSID
+            string "路由器 WiFi SSID (留空可运行时配网)"
+            default ""
+
+        config LINK_WIFI_PASSWORD
+            string "WiFi 密码"
+            default ""
+
+        config LINK_AP_SSID
+            string "热点 SSID（填写热点口令后启用）"
+            default "ESP-SWD"
+
+        config LINK_AP_PASSWORD
+            string "热点 WPA2 口令（8–63 字节，留空关闭热点）"
+            default ""
+
+        config LINK_TCP_PORT
+            int "DAP 服务 TCP 端口 (pyOCD remote 协议)"
+            default 5555
+
+        config LINK_SERIAL_TCP_PORT
+            int "串口桥 TCP 端口"
+            default 5556
+
+        config LINK_OTA_TCP_PORT
+            int "ESP32 OTA TCP port"
+            range 1 65535
+            default 5557
+
+        config OTA_IDLE_TIMEOUT_SECONDS
+            int "OTA receive idle timeout (seconds)"
+            range 30 600
+            default 120
+
+        config OTA_READY_TIMEOUT_SECONDS
+            int "OTA verified image activation timeout (seconds)"
+            range 60 3600
+            default 600
+
+    endmenu
+
+    menu "5. 蓝牙链路"
+
+        config LINK_BLE_ENABLE
+            bool "启用 BLE DAP/串口桥"
+            default y
+
+        config LINK_BLE_NAME
+            string "BLE 设备名"
+            default "ESP-SWD"
+
+        config BLE_OTA_BUTTON_GPIO
+            int "BLE OTA 授权按钮 GPIO（低有效，长按 2 秒；-1 禁用）"
+            range -1 48
+            default 0
+            help
+                默认开发板 BOOT 按钮。只在程序运行时长按，不要同时复位。
+                也可用控制台 ota arm 开放 5 分钟升级窗口。
+
+        config BLE_OTA_REQUIRE_ENCRYPTION
+            bool "Require an encrypted BLE connection for OTA writes"
+            default y
+            help
+                Pair/encrypt the BLE connection before uploading firmware.
+                Just Works encryption is not image signing or MITM protection.
+
+    endmenu
+
+    menu "6. 本地面板与 microSD"
+
+        config FRONT_PANEL_ENABLED
+            bool "启用 ST7789、六键和 1-bit SDMMC"
+            default y
+            help
+                使用本板固定引脚表。若自定义 SWD/UART/OTA 引脚与面板共用，
+                固件会跳过面板初始化。
+
+        if FRONT_PANEL_ENABLED
+            config FRONT_LCD_CLOCK_MHZ
+                int "ST7789 SPI3 时钟 (MHz)"
+                range 1 40
+                default 20
+
+            config FRONT_LCD_INVERT
+                bool "ST7789 显示反色模式"
+                default y
+
+            config FRONT_LCD_BL_ACTIVE_LOW
+                bool "LCD 背光控制低有效"
+                default n
+        endif
+
+    endmenu
+
+endmenu
