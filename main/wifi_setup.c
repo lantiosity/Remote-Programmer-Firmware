@@ -281,8 +281,8 @@ static int access_cb(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt *
     return 0;
 }
 static const struct ble_gatt_chr_def chars[] = {
-    {.uuid=&request_uuid.u, .access_cb=access_cb, .flags=BLE_GATT_CHR_F_WRITE},
-    {.uuid=&reply_uuid.u, .access_cb=access_cb, .flags=BLE_GATT_CHR_F_READ}, {0}
+    {.uuid=&request_uuid.u, .access_cb=access_cb, .flags=BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
+    {.uuid=&reply_uuid.u, .access_cb=access_cb, .flags=BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC}, {0}
 };
 static const struct ble_gatt_svc_def services[] = {
     {.type=BLE_GATT_SVC_TYPE_PRIMARY, .uuid=&svc_uuid.u, .characteristics=chars}, {0}

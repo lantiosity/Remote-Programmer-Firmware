@@ -164,13 +164,18 @@ static void tcp_serial_tx_task(void *arg)
 
 /* ---------------- DAP TCP 服务 ---------------- */
 
-/* 客户端 fd 统一设置：Nagle 关闭 + 1s 发送超时（避免对端不读把任务卡死） */
-static void tune_client_fd(int fd)
+/* TCP probes reclaim unreachable peers in about 60 seconds while keeping
+ * responsive but idle debug/serial clients connected. */
+static bool tune_client_fd(int fd)
 {
-    int one = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    const int one = 1, idle = 30, interval = 10, probes = 3;
+    const struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0 &&
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0 &&
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) == 0 &&
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval)) == 0 &&
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes)) == 0 &&
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)) == 0;
 }
 
 static void tcp_dap_task(void *arg)
@@ -222,7 +227,11 @@ static void tcp_dap_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
-            tune_client_fd(fd);
+            if (!tune_client_fd(fd)) {
+                ESP_LOGW(TAG, "DAP 客户端套接字配置失败 (errno=%d)", errno);
+                close(fd);
+                continue;
+            }
             xSemaphoreTake(s_dap_send_lock, portMAX_DELAY);
             s_dap_epoch++;
             s_dap_fd = fd;
@@ -284,6 +293,19 @@ static bool serial_tcp_sink(int token, const uint8_t *data, size_t len)
     return false;
 }
 
+static bool queue_tcp_serial(int fd, const serial_input_chunk_t *chunk)
+{
+    for (;;) {
+        esp_err_t err = serial_bridge_to_target(chunk, pdMS_TO_TICKS(250));
+        if (err != ESP_ERR_TIMEOUT) return err == ESP_OK;
+
+        /* A keepalive error must also release the socket while UART is full. */
+        struct pollfd socket = {.fd = fd};
+        int ready = poll(&socket, 1, 0);
+        if (ready < 0 || (socket.revents & (POLLERR | POLLHUP | POLLNVAL))) return false;
+    }
+}
+
 static void tcp_serial_task(void *arg)
 {
     (void)arg;
@@ -328,7 +350,11 @@ static void tcp_serial_task(void *arg)
                 vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
-            tune_client_fd(fd);
+            if (!tune_client_fd(fd)) {
+                ESP_LOGW(TAG, "串口客户端套接字配置失败 (errno=%d)", errno);
+                close(fd);
+                continue;
+            }
             xSemaphoreTake(s_serial_send_lock, portMAX_DELAY);
             s_serial_fd = fd;
             ++s_serial_epoch;
@@ -349,8 +375,7 @@ static void tcp_serial_task(void *arg)
                     break;
                 }
                 chunk.len = (size_t)n;
-                /* Wait in this socket's reader only, allowing TCP flow control. */
-                if (serial_bridge_to_target(&chunk, portMAX_DELAY) != ESP_OK) break;
+                if (!queue_tcp_serial(fd, &chunk)) break;
             }
             serial_bridge_unsubscribe(serial_tcp_sink, token);
             xSemaphoreTake(s_serial_send_lock, portMAX_DELAY);

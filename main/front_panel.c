@@ -216,6 +216,7 @@ static const char *error_detail(esp_err_t err)
     case ESP_ERR_NOT_ALLOWED: return "受保护的目标或存储";
     case ESP_ERR_NOT_FOUND: return s_image.saved ? "没有板载镜像" : "找不到存储卡镜像";
     case ESP_ERR_INVALID_SIZE: return "镜像大小无效";
+    case ESP_ERR_INVALID_VERSION: return "请选择目标镜像";
     case ESP_ERR_NO_MEM: return "可用内存不足";
     case ESP_ERR_TIMEOUT: return "操作超时";
     default: return "请检查接线或存储卡";
@@ -298,8 +299,8 @@ static void handle_press(unsigned key)
         if (key == BACK) s_page = s_image.saved ? PANEL_HOME : PANEL_FILES;
         if (key == UP && s_field) --s_field;
         if (key == DOWN && s_field < (s_image.saved ? 2u : 3u)) ++s_field;
-        if (key == LEFT || key == RIGHT || (key == OK && s_field < 2)) adjust_setup(key);
-        if (key == OK && s_field >= 2) {
+        if (key == LEFT || key == RIGHT) adjust_setup(key);
+        if (key == OK) {
             s_saving = s_field == 3;
             s_page = PANEL_CONFIRM;
             s_hold_started = 0;

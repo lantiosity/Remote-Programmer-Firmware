@@ -26,6 +26,7 @@
 #include "link.h"
 #include "serial_bridge.h"
 static const char *TAG = "ble";
+void ble_store_config_init(void);
 
 /* 特征用途标记 */
 enum {
@@ -467,6 +468,10 @@ esp_err_t ble_dev_init(void)
     ble_hs_cfg.reset_cb = on_reset;
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
     ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
 
     ble_svc_gap_init();
     ble_svc_gatt_init();
@@ -490,6 +495,7 @@ esp_err_t ble_dev_init(void)
     rc = ble_gatts_count_cfg(wifi_setup_services());
     if (rc == 0) rc = ble_gatts_add_svcs(wifi_setup_services());
     if (rc != 0) return ESP_FAIL;
+    ble_store_config_init();
     ble_svc_gap_device_name_set(cfg_ble_name());
     link_register_sender(LINK_SINK_BLE, ble_dap_send);
     nimble_port_freertos_init(host_task);

@@ -17,6 +17,7 @@
 
 #include "app_cfg.h"
 #include "ble_ota.h"
+#include "esp_swdlink_image.h"
 #include "net_dev.h"
 #include "serial_bridge.h"
 #include "target_flash_h743.h"
@@ -328,17 +329,6 @@ static esp_err_t wifi_scan(httpd_req_t *req)
     return err;
 }
 
-static bool ota_header_valid(const uint8_t *image)
-{
-    esp_image_header_t header;
-    esp_app_desc_t desc;
-    memcpy(&header, image, sizeof(header));
-    memcpy(&desc, image + sizeof(header) + sizeof(esp_image_segment_header_t), sizeof(desc));
-    return header.magic == ESP_IMAGE_HEADER_MAGIC && header.chip_id == ESP_CHIP_ID_ESP32S3 &&
-        desc.magic_word == ESP_APP_DESC_MAGIC_WORD &&
-        strncmp(desc.project_name, esp_app_get_description()->project_name, sizeof(desc.project_name)) == 0;
-}
-
 static esp_err_t upload(httpd_req_t *req)
 {
     response_headers(req);
@@ -378,13 +368,15 @@ static esp_err_t upload(httpd_req_t *req)
         received += (size_t)n;
     }
     const bool allowed = received == size && authorized(req);
-    if (!allowed || (ota && !ota_header_valid(image))) {
+    const bool self_image = allowed && esp_swdlink_image(image, size);
+    if (!allowed || ota != self_image) {
         free(image);
         if (received != size)
             return upload_error(req, HTTPD_408_REQ_TIMEOUT, "Upload incomplete or timed out");
         if (!allowed)
             return upload_error(req, HTTPD_403_FORBIDDEN, "Setup code expired");
-        return upload_error(req, HTTPD_400_BAD_REQUEST, "Expected an ESP-SWD OTA app image");
+        return upload_error(req, HTTPD_400_BAD_REQUEST, ota ? "Expected an ESP-SWD OTA app image" :
+                            "Use the OTA page for ESP-SWD firmware; select a STM32 target image here");
     }
 
     uint32_t id;

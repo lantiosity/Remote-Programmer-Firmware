@@ -129,6 +129,8 @@ USB、WiFi 和 BLE 的 SWD 操作由单个会话独占。只读设备查询可�
 
 remote 会话交出 SWD 后仍可用 `close` 清理自己的 AP handle。当前 SWD 所有者可以继续操作。
 
+Wi-Fi DAP 和串口 TCP 都开启 keepalive。空闲 30 秒后开始探测，间隔 10 秒，连续 3 次未获应答时约 60 秒回收失联连接。正常应答的空闲 TCP 连接继续保留，SWD 的 120 秒空闲租约仍独立计时。
+
 探针复位命令需要 nRESET。由主机调试器发起的软件复位需要先选定目标核及其 MEM-AP。
 
 参数大小：TCP 一次最多收 20KB 的 JSON 行（够 `write_block32` 写 1KB 页），

@@ -14,4 +14,4 @@ Control：BEGIN=`01 + size:u32 + sha256:32bytes`，FINISH=`03`，ACTIVATE=`04`�
 
 默认授权按钮 GPIO0，长按约 2 秒；控制台 `ota status` 查询状态，`ota arm [秒数]` 开放窗口（1～600 秒），`ota off` 关闭。空闲超时、断线或取消释放升级会话，不支持断点续传。升级时停止其他调试业务。
 
-状态布局及错误码以 `main/include/ble_ota.h`、`main/ble_ota.c` 为准。BLE 配网使用另一个服务（前缀 6e400030），实现见 `main/ble_dev.c` 与 `main/wifi_setup.c`。
+状态布局及错误码以 `main/include/ble_ota.h`、`main/ble_ota.c` 为准。BLE 配网使用另一个服务（前缀 6e400030），请求和应答特征均要求链路加密。保存和清除仍须开放包含 BLE 的物理授权窗口。默认在 NVS 保存配对密钥，以便重启后重新建立加密连接。

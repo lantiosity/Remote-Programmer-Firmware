@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 
 #include "app_cfg.h"
+#include "esp_swdlink_image.h"
 #include "link.h"
 #include "probe_core.h"
 #include "target_flash_h743.h"
@@ -141,6 +142,7 @@ esp_err_t target_flash_h743(uint32_t addr, const uint8_t *image, size_t size,
 {
     if (!image || !report || !target_flash_h743_range(addr, size) || cfg_probe()->nreset_gpio < 0)
         return ESP_ERR_INVALID_ARG;
+    if (esp_swdlink_image(image, size)) return ESP_ERR_INVALID_VERSION;
     probe_lock();
     if (link_swd_session_active()) {
         probe_unlock();

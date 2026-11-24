@@ -254,7 +254,8 @@
     prepare:'正在准备 OTA', program:'正在写入', verify:'正在校验', activate:'正在设置启动分区'};
   const flashErrors = {ESP_ERR_INVALID_STATE:'SWD 正被其他客户端占用，请断开调试会话后重试',
     ESP_ERR_NOT_SUPPORTED:'芯片型号或 Flash 容量不匹配', ESP_ERR_INVALID_CRC:'读回校验不匹配',
-    ESP_ERR_NOT_ALLOWED:'目标 Flash 配置受限或扇区受到保护'};
+    ESP_ERR_NOT_ALLOWED:'目标 Flash 配置受限或扇区受到保护',
+    ESP_ERR_INVALID_VERSION:'请选择 STM32 目标镜像'};
   async function confirmBoot(image, message) {
     message.textContent = '设备正在重启，等待校验运行镜像…';
     await wait(2500);

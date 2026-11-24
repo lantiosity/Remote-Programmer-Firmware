@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import unittest
+from build_remote import build_remote
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = ROOT / 'build/native-tests'
@@ -18,31 +19,11 @@ BUILD.mkdir(parents=True, exist_ok=True)
 GCC = shutil.which('gcc')
 if not GCC:
     raise SystemExit('Native gcc required (e.g. MSYS2 UCRT64 on Windows).')
-CJSON = ROOT / 'managed_components/espressif__cjson/cJSON'
-if not (CJSON / 'cJSON.c').exists():
-    raise SystemExit('Run idf.py reconfigure first to resolve the locked cJSON dependency.')
-backend = (ROOT / 'tests/native/remote_backend.c').read_text(encoding='utf-8')
-header = (ROOT / 'main/include/probe_core.h').read_text(encoding='utf-8')
-stubs = []
-for result, name, args in re.findall(r'\b(esp_err_t|probe_status_t|bool|uint32_t|uint8_t|void)\s+(probe_\w+)\(([^;{}]*)\)\s*;', header):
-    if re.search(r'\b' + name + r'\s*\(', backend):
-        continue
-    stubs.append(f'{result} {name}({args}) {{' + ('' if result == 'void' else ' return 0;') + ' }')
-(BUILD / 'remote_backend.c').write_text(backend + '\n' + '\n'.join(stubs), encoding='utf-8')
-library = BUILD / ('remote.dll' if os.name == 'nt' else 'remote.so')
-subprocess.run([GCC, '-shared', '-fPIC', *(['-Wl,--export-all-symbols'] if os.name == 'nt' else []), '-std=c11', '-Wall', '-Wextra', '-Werror',
-                '-Wno-unused-parameter', '-I' + str(ROOT / 'tests/native/include'),
-                '-I' + str(ROOT / 'main/include'), '-I' + str(ROOT / 'main'), '-I' + str(CJSON),
-                str(ROOT / 'main/dap_server.c'), str(ROOT / 'main/dap_cmsis.c'),
-                str(ROOT / 'main/dap_session.c'), str(CJSON / 'cJSON.c'),
-                str(BUILD / 'remote_backend.c'), '-lm', '-o', str(library)], check=True)
 if os.name == 'nt':
     _dll_path = os.add_dll_directory(str(Path(GCC).parent))
-lib = ctypes.CDLL(str(library))
+lib = build_remote(BUILD)
 lib.test_remote_process.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]
 lib.test_remote_process.restype = ctypes.c_size_t
-lib.test_link_request.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p]
-lib.test_link_request.restype = ctypes.c_size_t
 lib.test_ota_window.argtypes = [ctypes.c_int64, ctypes.c_int64, ctypes.c_uint, ctypes.c_uint]
 lib.test_ota_window.restype = ctypes.c_bool
 
@@ -94,6 +75,29 @@ def request(name, args, ident=1, raw=None):
     result = json.loads(output.raw[:size])
     assert size < len(output)
     return result
+
+
+class TargetFlashTests(unittest.TestCase):
+    def test_device_image_is_rejected_before_touching_swd(self):
+        lib.test_link_init()
+        progress = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_size_t)
+        phases = []
+        report = progress(lambda phase, done, total: phases.append(phase))
+        lib.target_flash_h743.argtypes = [ctypes.c_uint32, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_bool, progress]
+        image = bytearray(512)
+        image[0] = 0xe9
+        image[12:14] = b'\x09\x00'
+        image[32:36] = b'\x32\x54\xcd\xab'
+        image[80:92] = b'esp_swdlink\0'
+        self.assertEqual(lib.target_flash_h743(0x08000000, bytes(image), len(image), False, report), 0x10a)
+        self.assertEqual(counter('test_connects'), 0)
+        self.assertFalse(phases)
+
+        for data in [image[:111], image[:91] + b'x' + image[92:], bytes(512)]:
+            phases.clear()
+            self.assertNotEqual(lib.target_flash_h743(0x08000000, bytes(data), len(data), False, report), 0x10a)
+            self.assertEqual(phases, [b'connect'])
+        self.assertEqual(counter('test_connects'), 3)
 
 
 class RemoteTests(unittest.TestCase):

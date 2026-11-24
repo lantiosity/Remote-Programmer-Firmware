@@ -1,6 +1,7 @@
 #include <string.h>
 #include "esp_app_desc.h"
 #include "probe_core.h"
+#include "app_cfg.h"
 #include "ota_policy.h"
 #include "wired_ota.h"
 #include "link.c"
@@ -15,6 +16,11 @@ bool test_send_failed;
 uint8_t test_data[8192];
 static dap_session_t test_parser_session;
 const char *cfg_serial_number(void) { return "native-test"; }
+const cfg_probe_pins_t *cfg_probe(void)
+{
+    static const cfg_probe_pins_t pins = {.nreset_gpio = 6};
+    return &pins;
+}
 const esp_app_desc_t *esp_app_get_description(void)
 {
     static const esp_app_desc_t app = {.version = "native-test"};
